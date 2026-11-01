@@ -1,13 +1,12 @@
 import Gio from 'gi://Gio';
 import Meta from 'gi://Meta';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
-import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {GnomeShellOverride} from './gnomeShellOverride.js';
 import {WindowManager} from './windowManager.js';
 
 const BUS_NAME = 'io.github.weLayerd.Gnome';
 const OBJECT_PATH = '/io/github/weLayerd/Gnome';
-const EXTENSION_RUNTIME_VERSION = 'gnome-window-bridge-v4-window-states';
+const EXTENSION_RUNTIME_VERSION = 'gnome-window-bridge-v5-monitor-connectors';
 const PROTOCOL_XML_PATH = 'protocol/io.github.weLayerd.Gnome.xml';
 
 function logDebug(message) {
@@ -110,12 +109,17 @@ export default class WeLayerdExtension extends Extension {
             return states;
 
         const focusWindow = global.display.get_focus_window();
-        const monitors = Main.layoutManager?.monitors ?? [];
         const monitorManager = global.backend?.get_monitor_manager?.() ?? null;
-        const connectorFor = index =>
-            monitors[index]?.connector ??
-            monitorManager?.get_connector_for_monitor?.(index) ??
-            '';
+        const logicalMonitors = monitorManager?.get_logical_monitors?.() ?? [];
+        // Meta.Window.get_monitor() reports a logical monitor index. Resolve
+        // its connector through the logical monitor's primary physical
+        // monitor — shell Monitor objects carry no connector property.
+        const connectorFor = index => {
+            const logical =
+                logicalMonitors.find(monitor => monitor.get_number?.() === index) ??
+                logicalMonitors[index];
+            return logical?.get_monitors?.()?.[0]?.get_connector?.() ?? '';
+        };
 
         for (const win of global.display.list_all_windows()) {
             if (!win || this._matches(win))
