@@ -47,7 +47,7 @@ pub(crate) fn view<'a>(
         properties = properties.push(
             container(
                 row![
-                    text(&property.label).size(14).width(Fill),
+                    text(render_html(&property.label)).size(14).width(Fill),
                     control(property, settings, language)
                 ]
                 .align_y(Alignment::Center)
@@ -121,7 +121,7 @@ fn control<'a>(
                 .options
                 .iter()
                 .map(|option| PropertyOption {
-                    label: option.label.clone(),
+                    label: render_html(&option.label),
                     value: option.value.clone(),
                 })
                 .collect::<Vec<_>>();
@@ -201,5 +201,12 @@ fn value_text(value: &Value) -> String {
 }
 
 fn render_html(value: &str) -> String {
-    html2text::from_read(value.as_bytes(), 56).unwrap_or_else(|_| value.to_string())
+    let rendered =
+        html2text::from_read(value.as_bytes(), 56).unwrap_or_else(|_| value.to_string());
+    rendered
+        .split('\n')
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
