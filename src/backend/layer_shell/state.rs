@@ -127,6 +127,11 @@ pub(super) struct FrameCallbackState {
     pub(super) pending: bool,
     pub(super) ready_for_next_frame: bool,
     pub(super) last_done_msec: Option<u32>,
+    /// Layer-shell surfaces are always visible, so wl_surface.frame is a valid
+    /// vsync clock. A GNOME window can be fully occluded, in which case the
+    /// compositor stops its frame callbacks and presentation would stall.
+    /// Ungated surfaces pace themselves with the render interval instead.
+    pub(super) gated: bool,
 }
 
 pub(super) struct BufferBookkeeping {
@@ -421,7 +426,7 @@ impl LayerShellState {
             input_proxy: None,
             last_input_region: None,
             buffers: BufferBookkeeping::default(),
-            frame_callback: FrameCallbackState::default(),
+            frame_callback: FrameCallbackState { gated: true, ..FrameCallbackState::default() },
             frame_stats: FrameStats::default(),
             diagnostics: RuntimeDiagnostics::default(),
             dmabuf_feedback: DmabufFeedbackState::default(),

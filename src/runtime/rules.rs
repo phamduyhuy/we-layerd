@@ -388,6 +388,48 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for ForeignToplevelProbe {
     }
 }
 
+/// GNOME has no wlr foreign-toplevel protocol. The we-layerd shell extension
+/// already tracks every window, so the rule collector polls its D-Bus bridge
+/// instead and maps the reply onto the same ToplevelActivity shape.
+pub(crate) struct GnomeToplevelMonitor {
+    connection: zbus::blocking::Connection,
+    bus_name: String,
+}
+
+impl GnomeToplevelMonitor {
+    pub(crate) fn connect(bus_name: &str) -> Result<Self> {
+        let connection = zbus::blocking::Connection::session()
+            .map_err(|_| crate::backend::gnome::dbus::extension_unreachable_error())?;
+        crate::backend::gnome::dbus::ping_extension(bus_name)?;
+        Ok(Self { connection, bus_name: bus_name.to_string() })
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(Vec<String>, Vec<ToplevelActivity>)> {
+        // Keep the collector cadence in line with the Wayland monitor.
+        std::thread::sleep(timeout);
+        let states =
+            crate::backend::gnome::dbus::get_window_states(&self.connection, &self.bus_name)?;
+        let mut outputs = BTreeSet::new();
+        let mut activities = Vec::with_capacity(states.len());
+        for (output, activated, maximized, fullscreen) in states {
+            if output.is_empty() {
+                continue;
+            }
+            outputs.insert(output.clone());
+            activities.push(ToplevelActivity {
+                outputs: vec![output],
+                activated,
+                maximized,
+                fullscreen,
+            });
+        }
+        Ok((outputs.into_iter().collect(), activities))
+    }
+}
+
 fn decode_toplevel_states(raw: &[u8]) -> (bool, bool, bool) {
     let mut maximized = false;
     let mut activated = false;

@@ -87,8 +87,8 @@ fn can_present_next_frame(state: &LayerShellState) -> bool {
     state.running
         && !state.pause_state.effective()
         && !state.stopping
-        && state.frame_callback.ready_for_next_frame
-        && !state.frame_callback.pending
+        && (!state.frame_callback.gated
+            || (state.frame_callback.ready_for_next_frame && !state.frame_callback.pending))
         && state.buffers.in_flight.len() < state.buffers.max_in_flight
 }
 
@@ -406,6 +406,7 @@ pub(crate) fn run_output_with_role(
             pending: false,
             ready_for_next_frame: true,
             last_done_msec: None,
+            gated: matches!(role, SurfaceRole::LayerShell),
         },
         frame_stats: Default::default(),
         diagnostics: RuntimeDiagnostics {

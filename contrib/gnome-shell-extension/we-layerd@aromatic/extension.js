@@ -1,11 +1,13 @@
 import Gio from 'gi://Gio';
+import Meta from 'gi://Meta';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {GnomeShellOverride} from './gnomeShellOverride.js';
 import {WindowManager} from './windowManager.js';
 
 const BUS_NAME = 'io.github.weLayerd.Gnome';
 const OBJECT_PATH = '/io/github/weLayerd/Gnome';
-const EXTENSION_RUNTIME_VERSION = 'gnome-window-bridge-v3-hanabi-port';
+const EXTENSION_RUNTIME_VERSION = 'gnome-window-bridge-v4-window-states';
 const PROTOCOL_XML_PATH = 'protocol/io.github.weLayerd.Gnome.xml';
 
 function logDebug(message) {
@@ -98,6 +100,40 @@ export default class WeLayerdExtension extends Extension {
     PauseVideo() {}
 
     ResumeVideo() {}
+
+    // Reports (output, activated, maximized, fullscreen) for every regular
+    // toplevel so the daemon can drive its pause/mute window rules on GNOME,
+    // which lacks the wlr foreign-toplevel protocol.
+    GetWindowStates() {
+        const states = [];
+        if (!this._target)
+            return states;
+
+        const focusWindow = global.display.get_focus_window();
+        const monitors = Main.layoutManager?.monitors ?? [];
+        const monitorManager = global.backend?.get_monitor_manager?.() ?? null;
+        const connectorFor = index =>
+            monitors[index]?.connector ??
+            monitorManager?.get_connector_for_monitor?.(index) ??
+            '';
+
+        for (const win of global.display.list_all_windows()) {
+            if (!win || this._matches(win))
+                continue;
+            if (win.get_window_type?.() !== Meta.WindowType.NORMAL)
+                continue;
+            if (!win.showing_on_its_workspace?.())
+                continue;
+
+            states.push([
+                connectorFor(win.get_monitor()),
+                win === focusWindow,
+                Boolean(win.maximized_horizontally && win.maximized_vertically),
+                Boolean(win.is_fullscreen?.() ?? win.fullscreen),
+            ]);
+        }
+        return states;
+    }
 
     _shouldManageWindow(metaWindow) {
         return this._matches(metaWindow);
