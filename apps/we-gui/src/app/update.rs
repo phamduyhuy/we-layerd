@@ -86,6 +86,16 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
             refresh_visible_gif_previews(app)
         }
         Message::Detail(message) => super::detail_update::update(app, message),
+        Message::FocusSearch => {
+            let id = if app.sidebar == Some(Sidebar::Detail)
+                && app.detail_tab == wallpaper_detail::DetailTab::UserProperties
+            {
+                "detail.properties.search"
+            } else {
+                "library.search"
+            };
+            iced::widget::operation::focus(id)
+        }
         Message::PlayPressed => play_selected(app, PlaybackStart::SwitchOrStart),
         Message::StopPressed => {
             let stopped = app.shutdown_runtime();
@@ -135,7 +145,7 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
             ])
         }
         Message::PaneResized(event) => {
-            let ratio = event.ratio.clamp(0.45, 0.82);
+            let ratio = usable_pane_ratio(event.ratio, app.viewport_width);
             app.panes.resize(event.split, ratio);
             app.library_viewport_width = (app.viewport_width * ratio).max(180.0);
             refresh_visible_gif_previews(app)
@@ -751,6 +761,10 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
                     app.playback_paused = status_value(&text, "phase") == Some("paused");
                     if app.playback_running || app.playback_paused {
                         app.runtime_outputs = parse_output_runtime_states(&text);
+                        if !app.runtime_outputs.is_empty() {
+                            app.playback_paused =
+                                app.runtime_outputs.values().all(|state| state.paused);
+                        }
                         app.running_source = status_value(&text, "source").map(str::to_string);
                         app.runtime_playlist_active =
                             status_section_value(&text, "playlist_runtime", "active")
@@ -779,9 +793,15 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
             };
             Task::none()
         }
-        Message::StatusTick => Task::perform(runtime::fetch_status(), Message::StatusLoaded),
+        Message::StatusTick => Task::batch([
+            Task::perform(runtime::fetch_status(), Message::StatusLoaded),
+            Task::perform(runtime::fetch_outputs(), Message::OutputsLoaded),
+        ]),
         Message::OutputsLoaded(result) => {
             if let Ok(outputs) = result {
+                if app.outputs == outputs {
+                    return Task::none();
+                }
                 app.outputs = outputs;
                 if app.sidebar == Some(Sidebar::Playlist) && app.playlist_selected.is_some() {
                     sync_selected_outputs_for_playlist(app);
@@ -806,6 +826,12 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
             app.library_viewport_height = size.height.max(1.0);
             if app.sidebar.is_none() {
                 app.library_viewport_width = size.width.max(180.0);
+            } else if let iced::widget::pane_grid::Node::Split { id, ratio, .. } =
+                app.panes.layout()
+            {
+                let (split, ratio) = (*id, usable_pane_ratio(*ratio, size.width));
+                app.panes.resize(split, ratio);
+                app.library_viewport_width = (size.width * ratio).max(180.0);
             }
             refresh_visible_gif_previews(app)
         }
@@ -897,6 +923,15 @@ fn finish_library_scan(
     if completion.accept_result {
         if let Ok(entries) = result {
             app.entries = entries;
+            if let Some(id) = app.selected_id.clone() {
+                if let Some(index) = app.entries.iter().position(|entry| entry.id == id) {
+                    select_wallpaper(app, index, false);
+                } else {
+                    app.selected_id = None;
+                    app.selected_content = None;
+                    app.selected_schema = UserPropertySchema { entries: Vec::new() };
+                }
+            }
             app.gif_preview_generation = app.gif_preview_generation.wrapping_add(1);
             app.animated_previews.clear();
             app.gif_preview_desired.clear();
@@ -1058,15 +1093,36 @@ fn persist_gui_preferences(app: &App) -> Task<Message> {
     })
 }
 
+fn usable_pane_ratio(ratio: f32, viewport_width: f32) -> f32 {
+    let maximum = (1.0 - 320.0 / viewport_width.max(640.0)).clamp(0.45, 0.82);
+    ratio.clamp(0.45, maximum)
+}
+
 fn select_wallpaper(app: &mut App, index: usize, show_details: bool) -> bool {
     let Some(entry) = app.entries.get(index).cloned() else {
         return false;
     };
 
+    if app.selected_id.as_deref() != Some(entry.id.as_str()) {
+        app.property_filter = Default::default();
+    }
     app.selected_id = Some(entry.id.clone());
-    app.selected_schema = UserPropertySchema::from_project_file(&entry.project_json)
-        .unwrap_or(UserPropertySchema { entries: Vec::new() });
-    let inherited_msaa = inherited_final_output_msaa(app.launch_settings.msaa_samples, entry.ty);
+    app.selected_schema = UserPropertySchema { entries: Vec::new() };
+    app.selected_content = Some(wallpaper_service::resolve_entry(&entry, app.language));
+    let selection = app.selected_content.as_ref().unwrap().clone().and_then(|resolved| {
+        UserPropertySchema::from_project_file(&entry.project_json)
+            .map(|schema| (resolved.ty, schema))
+            .map_err(|error| {
+                format!(
+                    "{}: {error:#}",
+                    app.language.text(crate::domain::i18n::Text::WallpaperCannotApply)
+                )
+            })
+    });
+    let inherited_msaa = inherited_final_output_msaa(
+        app.launch_settings.msaa_samples,
+        selection.as_ref().map(|(ty, _)| *ty).unwrap_or(entry.ty),
+    );
     let profile = app
         .launch_settings
         .wallpapers
@@ -1077,14 +1133,22 @@ fn select_wallpaper(app: &mut App, index: usize, show_details: bool) -> bool {
         })
         .clone();
     set_resolution_inputs(app, &profile);
-    sync_selected_outputs_for_wallpaper(app);
-    if let Err(error) = persist_wallpaper_profiles(app) {
-        app.runtime_status = RuntimeStatus::ConfigSaveFailed(error.clone());
-        eprintln!("failed to save config: {error}");
-    }
     if show_details {
         app.sidebar = Some(Sidebar::Detail);
-        app.detail_tab = wallpaper_detail::DetailTab::Actions;
+    }
+    match selection {
+        Ok((_, schema)) => app.selected_schema = schema,
+        Err(error) => {
+            app.runtime_status = RuntimeStatus::Raw(error);
+            return false;
+        }
+    }
+    sync_selected_outputs_for_wallpaper(app);
+    if show_details {
+        if let Err(error) = persist_wallpaper_profiles(app) {
+            app.runtime_status = RuntimeStatus::ConfigSaveFailed(error.clone());
+            eprintln!("failed to save config: {error}");
+        }
     }
     true
 }
@@ -1649,6 +1713,21 @@ enum PlaybackStart {
 }
 
 fn play_selected(app: &mut App, start: PlaybackStart) -> Task<Message> {
+    let selection = app
+        .selected_id
+        .as_deref()
+        .and_then(|id| app.entries.iter().find(|entry| entry.id == id))
+        .ok_or_else(|| {
+            app.language.text(crate::domain::i18n::Text::SelectWallpaperDetails).to_string()
+        })
+        .and_then(|entry| wallpaper_service::resolve_entry(entry, app.language));
+    match selection {
+        Ok(resolved) => app.selected_content = Some(Ok(resolved)),
+        Err(error) => {
+            app.runtime_status = RuntimeStatus::Raw(error);
+            return Task::none();
+        }
+    }
     app.runtime_shutdown = false;
     if !app.layerd_available {
         app.runtime_status = RuntimeStatus::DaemonNotFound;
@@ -1831,7 +1910,14 @@ fn mark_selected_wallpaper_running(app: &mut App) {
 fn selected_wallpaper_source(app: &App) -> Option<String> {
     let selected_id = app.selected_id.as_deref()?;
     let entry = app.entries.iter().find(|entry| entry.id == selected_id)?;
-    Some(entry.project_json.parent().unwrap_or(&entry.project_json).to_string_lossy().into_owned())
+    match &app.selected_content {
+        Some(Ok(resolved)) => Some(resolved.project_json.parent().unwrap().display().to_string()),
+        Some(Err(_)) => None,
+        None if entry.ty != we_core::wallpaper::WallpaperType::Preset => {
+            wallpaper_service::playback_source(entry)
+        }
+        None => None,
+    }
 }
 
 fn parse_output_runtime_states(
@@ -1845,7 +1931,10 @@ fn parse_output_runtime_states(
     if let Some(runtime) = document.get("runtime").and_then(toml::Value::as_table) {
         if let Some(output_name) = runtime.get("output_name").and_then(toml::Value::as_str) {
             if !output_name.is_empty() {
-                outputs.insert(output_name.to_string(), output_runtime_state(runtime));
+                outputs.insert(
+                    output_name.to_string(),
+                    output_runtime_state(runtime, document.get("presentation")),
+                );
             }
         }
     }
@@ -1855,13 +1944,19 @@ fn parse_output_runtime_states(
             let Some(runtime) = value.get("runtime").and_then(toml::Value::as_table) else {
                 continue;
             };
-            outputs.insert(output_name.clone(), output_runtime_state(runtime));
+            outputs.insert(
+                output_name.clone(),
+                output_runtime_state(runtime, value.get("presentation")),
+            );
         }
     }
     outputs
 }
 
-fn output_runtime_state(runtime: &toml::value::Table) -> OutputRuntimeState {
+fn output_runtime_state(
+    runtime: &toml::value::Table,
+    presentation: Option<&toml::Value>,
+) -> OutputRuntimeState {
     let source =
         runtime.get("source").and_then(toml::Value::as_str).unwrap_or_default().to_string();
     let playlist_active = runtime
@@ -1873,7 +1968,20 @@ fn output_runtime_state(runtime: &toml::value::Table) -> OutputRuntimeState {
         .get("playlist_index")
         .and_then(toml::Value::as_integer)
         .and_then(|index| usize::try_from(index).ok());
-    OutputRuntimeState { source, playlist_active, playlist_index }
+    let flag = |key| {
+        presentation
+            .and_then(|value| value.get(key))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    };
+    OutputRuntimeState {
+        source,
+        playlist_active,
+        playlist_index,
+        paused: flag("paused"),
+        manual_paused: flag("manual_paused"),
+        rule_paused: flag("rule_paused"),
+    }
 }
 
 #[cfg(test)]

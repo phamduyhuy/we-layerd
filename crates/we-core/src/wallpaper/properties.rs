@@ -19,6 +19,7 @@ pub struct UserProperty {
     pub precision: Option<u32>,
     pub options: Vec<UserPropertyOption>,
     pub order: f64,
+    pub condition: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,9 +43,17 @@ pub struct UserPropertyOption {
 
 impl UserPropertySchema {
     pub fn from_project_file(path: &Path) -> Result<Self> {
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        Self::from_project_json(&raw).with_context(|| format!("invalid JSON: {}", path.display()))
+        let resolved = super::resolve_wallpaper_source(path)?;
+        let raw = fs::read_to_string(&resolved.project_json)
+            .with_context(|| format!("failed to read {}", resolved.project_json.display()))?;
+        let mut schema = Self::from_project_json(&raw)
+            .with_context(|| format!("invalid JSON: {}", resolved.project_json.display()))?;
+        for entry in &mut schema.entries {
+            if let Some(value) = resolved.user_properties.get(&entry.key) {
+                entry.default = value.clone();
+            }
+        }
+        Ok(schema)
     }
 
     pub fn from_project_json(raw: &str) -> Result<Self> {
@@ -91,10 +100,10 @@ fn parse_entry(key: &str, descriptor: &Value) -> Option<UserProperty> {
         "slider" => UserPropertyKind::Slider,
         "combo" => UserPropertyKind::Combo,
         "color" => UserPropertyKind::Color,
-        "text" | "textinput" => UserPropertyKind::Text,
+        "textinput" => UserPropertyKind::Text,
         "file" | "replacetexture" | "texture" | "scenetexture" => UserPropertyKind::File,
         "directory" => UserPropertyKind::Directory,
-        "html" => UserPropertyKind::Html,
+        "html" | "text" => UserPropertyKind::Html,
         _ => UserPropertyKind::Unsupported(raw_kind),
     };
     let options = descriptor
@@ -128,6 +137,12 @@ fn parse_entry(key: &str, descriptor: &Value) -> Option<UserProperty> {
         precision: descriptor.get("precision").and_then(Value::as_u64).map(|value| value as u32),
         options,
         order: descriptor.get("order").and_then(Value::as_f64).unwrap_or_default(),
+        condition: descriptor
+            .get("condition")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|condition| !condition.is_empty())
+            .map(ToOwned::to_owned),
     })
 }
 
@@ -163,5 +178,21 @@ mod tests {
         .expect("schema should parse");
         let values = schema.values_json(&BTreeMap::from([("speed".to_owned(), json!(2.0))]));
         assert_eq!(values, json!({"enabled":true,"speed":2.0}));
+    }
+
+    #[test]
+    fn retains_display_conditions_and_distinguishes_static_labels_from_text_inputs() {
+        let schema = UserPropertySchema::from_project_json(r#"{"general":{"properties":{
+            "enabled":{"type":"bool","value":false},
+            "label":{"type":"text","text":"<b>Instructions</b>","value":""},
+            "caption":{"type":"textinput","text":"Caption","value":"Hello","condition":"enabled.value == true"}
+        }}}"#).unwrap();
+        let caption = schema.entries.iter().find(|p| p.key == "caption").unwrap();
+        assert_eq!(caption.condition.as_deref(), Some("enabled.value == true"));
+        assert_eq!(caption.kind, UserPropertyKind::Text);
+        assert_eq!(
+            schema.entries.iter().find(|p| p.key == "label").unwrap().kind,
+            UserPropertyKind::Html
+        );
     }
 }

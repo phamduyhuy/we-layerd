@@ -6,6 +6,19 @@ use super::{App, Message};
 
 pub(crate) fn subscription(app: &App) -> Subscription<Message> {
     let mut subscriptions = vec![
+        iced::keyboard::listen().filter_map(|event| {
+            let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+                return None;
+            };
+            match key {
+                iced::keyboard::Key::Character(value)
+                    if modifiers.command() && value.eq_ignore_ascii_case("f") =>
+                {
+                    Some(Message::FocusSearch)
+                }
+                _ => None,
+            }
+        }),
         window::resize_events().map(|(_id, size)| Message::WindowResized(size)),
         window::open_events().map(Message::WindowOpened),
         window::close_events().map(Message::WindowClosed),
@@ -14,7 +27,7 @@ pub(crate) fn subscription(app: &App) -> Subscription<Message> {
         iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::ThemeTick),
         iced::time::every(std::time::Duration::from_secs(3)).map(|_| Message::StatusTick),
     ];
-    if gif_tick_needed(app.animated_previews.len()) {
+    if app.main_window_id.is_some() && gif_tick_needed(app.animated_previews.len()) {
         subscriptions.push(
             iced::time::every(std::time::Duration::from_millis(16)).map(|_| Message::GifTick),
         );

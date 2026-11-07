@@ -1,8 +1,6 @@
 use iced::{
     alignment::Vertical,
-    widget::{
-        button, column, container, image, responsive, row, scrollable, stack, text, text_input,
-    },
+    widget::{button, column, container, image, responsive, row, scrollable, text, text_input},
     Background, Border, Color, ContentFit, Element, Fill, Theme,
 };
 use we_core::wallpaper::{WallpaperEntry, WallpaperType};
@@ -11,7 +9,7 @@ use crate::{
     app::{App, Message},
     domain::{
         i18n::{Language, Text},
-        library_grid::{grid_window, GridWindow},
+        library_grid::{grid_window, GridWindow, CARD_CAPTION_HEIGHT},
         ui_state::AnimatedPreview,
     },
 };
@@ -81,37 +79,43 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
     .spacing(8);
     let toolbar = row![
         column![
-            text(language.text(Text::Wallpapers)).size(28),
-            text(language.item_count(app.entries.len())).size(13)
+            text(language.text(Text::Wallpapers)).size(22),
+            text(if app.filtered_entry_indices.len() == app.entries.len() {
+                language.item_count(app.entries.len())
+            } else {
+                format!("{} / {}", app.filtered_entry_indices.len(), app.entries.len())
+            })
+            .size(12)
+            .color(crate::ui::theme::MUTED)
         ]
         .spacing(2)
         .width(Fill),
         container(
-            button(text(format!("↻  {}", language.text(Text::RefreshLibrary))).size(16))
+            button(text(language.text(Text::RefreshLibrary)).size(13))
                 .on_press(Message::RefreshLibrary)
                 .style(top_bar_button_style),
         )
         .id("library.refresh"),
         container(
-            button(text(format!("☷  {}", language.text(Text::Playlists))).size(16))
+            button(text(language.text(Text::Playlists)).size(13))
                 .on_press(Message::PlaylistsPressed)
                 .style(top_bar_button_style),
         )
         .id("library.playlists"),
         container(
-            button(text(format!("▦  {}", language.text(Text::Profiles))).size(16))
+            button(text(language.text(Text::Profiles)).size(13))
                 .on_press(Message::ProfilesPressed)
                 .style(top_bar_button_style),
         )
         .id("library.profiles"),
         container(
-            button(text(format!("◷  {}", language.text(Text::SmartScenes))).size(16))
+            button(text(language.text(Text::SmartScenes)).size(13))
                 .on_press(Message::ScenesPressed)
                 .style(top_bar_button_style),
         )
         .id("library.scenes"),
         container(
-            button(text(format!("⚙  {}", language.text(Text::OpenSettings))).size(16))
+            button(text(language.text(Text::Settings)).size(13))
                 .on_press(Message::SettingsPressed)
                 .style(top_bar_button_style),
         )
@@ -122,32 +126,40 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
         column![
             toolbar,
             row![
-                text_input(language.text(Text::SearchWallpapers), &app.search_query)
-                    .id("library.search")
-                    .on_input(Message::SearchChanged)
-                    .padding(12)
-                    .style(search_style)
-                    .width(Fill),
+                crate::ui::search_input::clearable(
+                    text_input(language.text(Text::SearchWallpapers), &app.search_query)
+                        .id("library.search")
+                        .on_input(Message::SearchChanged)
+                        .padding([10, 12])
+                        .size(14)
+                        .style(search_style)
+                        .width(Fill),
+                    Message::SearchChanged(String::new())
+                ),
                 filters,
             ]
             .spacing(12)
             .align_y(Vertical::Center),
-            scrollable(grid)
-                .id("library.scroll")
-                .on_scroll(|viewport| {
-                    let bounds = viewport.bounds();
-                    Message::LibraryScrolled {
-                        offset_y: viewport.absolute_offset().y,
-                        viewport_width: bounds.width,
-                        viewport_height: bounds.height,
-                    }
-                })
-                .width(Fill)
-                .height(Fill),
+            scrollable(
+                container(grid)
+                    .padding(iced::Padding { right: 12.0, ..Default::default() })
+                    .width(Fill)
+            )
+            .id("library.scroll")
+            .on_scroll(|viewport| {
+                let bounds = viewport.bounds();
+                Message::LibraryScrolled {
+                    offset_y: viewport.absolute_offset().y,
+                    viewport_width: bounds.width,
+                    viewport_height: bounds.height,
+                }
+            })
+            .width(Fill)
+            .height(Fill),
         ]
         .spacing(16),
     )
-    .padding(24)
+    .padding(16)
     .width(Fill)
     .height(Fill)
     .style(library_style)
@@ -188,7 +200,7 @@ fn build_wallpaper_grid<'a>(
     if layout.bottom_spacer > 0.0 {
         root = root.push(container(text("")).width(Fill).height(layout.bottom_spacer));
     }
-    container(root).padding([0, 12]).width(Fill).into()
+    container(root).width(Fill).into()
 }
 
 fn make_wallpaper_card<'a>(
@@ -218,51 +230,41 @@ fn make_wallpaper_card<'a>(
             .into()
     };
 
-    let chip = container(text(wallpaper_type_name(entry.ty, language)).size(12))
-        .padding([3, 8])
-        .style(|_theme: &Theme| container::Style {
-            text_color: Some(Color::WHITE),
-            background: Some(Background::Color(Color { r: 0.0, g: 0.0, b: 0.0, a: 0.45 })),
-            border: Border { radius: 10.0.into(), ..Default::default() },
-            ..Default::default()
-        });
-    let title = container(text(&entry.title).size(13).color(Color::WHITE))
-        .width(Fill)
-        .padding([3, 8])
-        .style(|_theme: &Theme| container::Style {
-            background: Some(Background::Color(Color { r: 0.0, g: 0.0, b: 0.0, a: 0.45 })),
-            border: Border { radius: 10.0.into(), ..Default::default() },
-            ..Default::default()
-        });
-    let overlay = container(row![title, chip].spacing(8).align_y(Vertical::Center))
-        .width(Fill)
-        .height(Fill)
-        .align_x(iced::alignment::Horizontal::Right)
-        .align_y(Vertical::Bottom)
-        .padding(8);
-    let border_color =
-        if selected { Color::from_rgb8(174, 198, 255) } else { Color::from_rgb8(70, 72, 78) };
-    let frame = container(stack![media, overlay]).width(card_width).height(card_height).style(
-        move |_theme: &Theme| container::Style {
-            border: Border {
-                radius: 16.0.into(),
-                width: if selected { 2.0 } else { 1.0 },
-                color: border_color,
-            },
-            shadow: if selected {
-                iced::Shadow {
-                    color: Color::from_rgba8(0, 0, 0, 0.35),
-                    blur_radius: 8.0,
-                    offset: iced::Vector::new(0.0, 2.0),
-                }
+    let caption = container(
+        row![
+            container(text(&entry.title).size(13).color(crate::ui::theme::TEXT))
+                .width(Fill)
+                .height(34)
+                .clip(true),
+            text(wallpaper_type_name(entry.ty, language)).size(11).color(crate::ui::theme::MUTED),
+        ]
+        .spacing(8)
+        .align_y(Vertical::Center),
+    )
+    .padding([5, 10])
+    .width(Fill)
+    .height(CARD_CAPTION_HEIGHT);
+    let frame = container(column![media, caption].spacing(0))
+        .width(card_width)
+        .height(card_height + CARD_CAPTION_HEIGHT)
+        .clip(true)
+        .style(move |_theme: &Theme| container::Style {
+            background: Some(Background::Color(if selected {
+                crate::ui::theme::RAISED
             } else {
-                iced::Shadow::default()
+                crate::ui::theme::PANEL
+            })),
+            border: Border {
+                radius: 6.0.into(),
+                width: if selected { 2.0 } else { 1.0 },
+                color: if selected { crate::ui::theme::ACCENT } else { Color::TRANSPARENT },
             },
             ..Default::default()
-        },
-    );
-    let card =
-        button(frame).on_press(Message::SelectWallpaper(index)).style(image_card_button_style);
+        });
+    let card = button(frame)
+        .padding(0)
+        .on_press(Message::SelectWallpaper(index))
+        .style(image_card_button_style);
     let mut content = column![card].spacing(6).width(card_width);
     if let Some(playlist_name) = playlist_selected {
         content = content.push(
@@ -270,7 +272,9 @@ fn make_wallpaper_card<'a>(
                 text(format!("+ {} · {}", language.text(Text::AddToPlaylist), playlist_name))
                     .size(12),
             )
-            .on_press(Message::AddWallpaperToSelectedPlaylist(index))
+            .on_press_maybe(
+                entry.ty.is_playable().then_some(Message::AddWallpaperToSelectedPlaylist(index)),
+            )
             .width(Fill)
             .style(top_bar_button_style),
         );
@@ -283,6 +287,8 @@ fn wallpaper_type_name(ty: WallpaperType, language: Language) -> &'static str {
         WallpaperType::Video => language.text(Text::TypeVideo),
         WallpaperType::Scene => language.text(Text::TypeScene),
         WallpaperType::Web => language.text(Text::TypeWeb),
+        WallpaperType::Asset => language.text(Text::TypeAsset),
+        WallpaperType::Preset => language.text(Text::TypePreset),
         WallpaperType::Unknown => language.text(Text::TypeUnknown),
     }
 }
@@ -299,7 +305,7 @@ fn image_card_button_style(_theme: &Theme, _status: button::Status) -> button::S
 
 fn library_style(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(Color::from_rgb8(24, 25, 28))),
+        background: Some(Background::Color(crate::ui::theme::BACKGROUND)),
         ..Default::default()
     }
 }
@@ -308,11 +314,11 @@ fn search_style(_theme: &Theme, status: text_input::Status) -> text_input::Style
     let border = if matches!(status, text_input::Status::Focused { .. }) {
         Color::from_rgb8(174, 198, 255)
     } else {
-        Color::from_rgb8(140, 144, 153)
+        crate::ui::theme::BORDER
     };
     text_input::Style {
-        background: Background::Color(Color::from_rgb8(43, 44, 48)),
-        border: Border { radius: 28.0.into(), width: 1.0, color: border },
+        background: Background::Color(crate::ui::theme::SURFACE),
+        border: Border { radius: 8.0.into(), width: 1.0, color: border },
         icon: Color::from_rgb8(196, 199, 204),
         placeholder: Color::from_rgb8(196, 199, 204),
         value: Color::from_rgb8(230, 225, 229),
@@ -327,12 +333,12 @@ fn filter_chip<'a>(
     value: Option<WallpaperType>,
 ) -> Element<'a, Message> {
     container(
-        button(text(if selected { format!("✓ {label}") } else { label.to_string() }).size(14))
+        button(text(label).size(13))
             .on_press(Message::TypeFilterSelected(value))
-            .padding([8, 14])
+            .padding([9, 12])
             .style(move |_theme, status| {
                 let background = if selected {
-                    Color::from_rgb8(70, 91, 129)
+                    crate::ui::theme::RAISED
                 } else if matches!(status, button::Status::Hovered) {
                     Color::from_rgb8(54, 56, 62)
                 } else {
@@ -346,9 +352,9 @@ fn filter_chip<'a>(
                         Color::from_rgb8(201, 203, 209)
                     },
                     border: Border {
-                        radius: 20.0.into(),
+                        radius: 6.0.into(),
                         width: if selected { 0.0 } else { 1.0 },
-                        color: Color::from_rgb8(143, 147, 156),
+                        color: crate::ui::theme::BORDER,
                     },
                     ..Default::default()
                 }
@@ -367,7 +373,7 @@ fn top_bar_button_style(_theme: &Theme, status: button::Status) -> button::Style
     button::Style {
         background: Some(Background::Color(background)),
         text_color: Color::from_rgb8(220, 225, 235),
-        border: Border { radius: 20.0.into(), ..Default::default() },
+        border: Border { radius: 6.0.into(), ..Default::default() },
         ..Default::default()
     }
 }

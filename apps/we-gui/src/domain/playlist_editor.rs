@@ -67,6 +67,9 @@ pub(crate) fn add_wallpaper(
     playlist_name: &str,
     entry: &WallpaperEntry,
 ) -> Result<(), String> {
+    if !entry.ty.is_playable() {
+        return Err("this item is not a standalone playable wallpaper".to_string());
+    }
     let playlist = playlist_mut(config, playlist_name)?;
     let source =
         entry.project_json.parent().unwrap_or(&entry.project_json).to_string_lossy().into_owned();
@@ -155,11 +158,21 @@ pub(crate) fn migrate_legacy_shuffle(
 
     let items = entries
         .iter()
-        .filter(|entry| match entry.ty {
-            WallpaperType::Video => legacy.include_video,
-            WallpaperType::Scene => legacy.include_scene,
-            WallpaperType::Web => legacy.include_web,
-            WallpaperType::Unknown => false,
+        .filter(|entry| {
+            let ty = if entry.ty == WallpaperType::Preset {
+                match we_core::wallpaper::resolve_wallpaper_source(&entry.project_json) {
+                    Ok(resolved) => resolved.ty,
+                    Err(_) => return false,
+                }
+            } else {
+                entry.ty
+            };
+            match ty {
+                WallpaperType::Video => legacy.include_video,
+                WallpaperType::Scene => legacy.include_scene,
+                WallpaperType::Web => legacy.include_web,
+                WallpaperType::Asset | WallpaperType::Preset | WallpaperType::Unknown => false,
+            }
         })
         .map(|entry| PlaylistItem {
             wallpaper_id: entry.id.clone(),
@@ -313,5 +326,74 @@ mod tests {
         assert!(!migrated_again);
         assert_eq!(config.definitions.len(), 1);
         assert_eq!(config.definitions["Migrated shuffle"].items.len(), 2);
+    }
+
+    #[test]
+    fn playlist_rejects_asset_and_unknown_metadata_without_mutation_but_accepts_preset() {
+        let root = std::env::temp_dir().join(format!(
+            "we-gui-playlist-content-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        for (id, metadata) in [
+            ("100", r#"{"type":"scene","file":"scene.pkg"}"#),
+            ("200", r#"{"dependency":"100","preset":{}}"#),
+            ("300", r#"{"category":"asset","file":"assets.json"}"#),
+            ("400", r#"{"type":"unsupported"}"#),
+        ] {
+            std::fs::create_dir_all(root.join(id)).unwrap();
+            std::fs::write(root.join(id).join("project.json"), metadata).unwrap();
+        }
+        let entries = we_core::wallpaper::scan_workshop_wallpapers(&root).unwrap();
+        let mut config = PlaylistConfig::default();
+        create_playlist(&mut config, "Focus").unwrap();
+        add_wallpaper(
+            &mut config,
+            "Focus",
+            entries.iter().find(|entry| entry.id == "100").unwrap(),
+        )
+        .unwrap();
+        let before = config.clone();
+        for id in ["300", "400"] {
+            assert!(add_wallpaper(
+                &mut config,
+                "Focus",
+                entries.iter().find(|entry| entry.id == id).unwrap()
+            )
+            .is_err());
+            assert_eq!(config, before);
+        }
+        add_wallpaper(
+            &mut config,
+            "Focus",
+            entries.iter().find(|entry| entry.id == "200").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config.definitions["Focus"].items[1].wallpaper_id, "200");
+        assert_eq!(
+            config.definitions["Focus"].items[1].source,
+            root.join("200").display().to_string()
+        );
+        let mut migrated = PlaylistConfig::default();
+        migrate_legacy_shuffle(
+            &mut migrated,
+            &entries,
+            LegacyShuffleMigration {
+                enabled: true,
+                interval_ms: 60_000,
+                include_video: false,
+                include_scene: true,
+                include_web: false,
+            },
+        )
+        .unwrap();
+        let mut ids = migrated.definitions["Migrated shuffle"]
+            .items
+            .iter()
+            .map(|item| item.wallpaper_id.as_str())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, ["100", "200"], "presets follow their base type filter");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

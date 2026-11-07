@@ -7,7 +7,8 @@ use crate::{
 use iced::{
     alignment::Horizontal,
     widget::{
-        button, checkbox, column, container, pick_list, row, scrollable, slider, text, text_input,
+        button, checkbox, column, container, image, pick_list, row, scrollable, slider, text,
+        text_input,
     },
     Background, Border, Color, Element, Fill, Theme,
 };
@@ -42,6 +43,11 @@ pub enum DetailMessage {
     PickPath { key: String, directory: bool },
     PathPicked { key: String, path: Option<String> },
     ResetProperties,
+    PropertySearchChanged(String),
+    ModifiedPropertiesToggled(bool),
+    InternalPropertiesToggled(bool),
+    ClearPropertyFilters,
+    ResetProperty(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,11 +64,13 @@ pub enum ResolutionMode {
 
 pub struct DetailViewState<'a> {
     pub entry: &'a WallpaperEntry,
+    pub availability: Result<WallpaperType, String>,
     pub settings: &'a WallpaperSettings,
     pub schema: &'a UserPropertySchema,
     pub resolution_width: &'a str,
     pub resolution_height: &'a str,
     pub active_tab: DetailTab,
+    pub property_filter: &'a crate::domain::property_search::PropertyFilter,
     pub is_running: bool,
     pub is_paused: bool,
     pub outputs: &'a [String],
@@ -73,11 +81,13 @@ pub struct DetailViewState<'a> {
 pub fn view(state: DetailViewState<'_>) -> Element<'_, DetailMessage> {
     let DetailViewState {
         entry,
+        availability,
         settings,
         schema,
         resolution_width,
         resolution_height,
         active_tab,
+        property_filter,
         is_running,
         is_paused,
         outputs,
@@ -100,25 +110,31 @@ pub fn view(state: DetailViewState<'_>) -> Element<'_, DetailMessage> {
     ]
     .spacing(8);
 
-    let body = match active_tab {
-        DetailTab::Actions => actions_view(
-            settings,
-            entry.ty,
-            resolution_width,
-            resolution_height,
-            outputs,
-            selected_outputs,
-            language,
-        ),
-        DetailTab::UserProperties => properties::view(schema, settings, language),
+    let can_apply = availability.is_ok();
+    let body = match availability {
+        Err(error) => text(error).color(Color::from_rgb8(255, 180, 171)).into(),
+        Ok(wallpaper_type) => match active_tab {
+            DetailTab::Actions => actions_view(
+                settings,
+                wallpaper_type,
+                resolution_width,
+                resolution_height,
+                outputs,
+                selected_outputs,
+                language,
+            ),
+            DetailTab::UserProperties => {
+                properties::view(schema, settings, property_filter, &entry.id, language)
+            }
+        },
     };
 
     let actions = container(
         row![
             container(icon_action(
                 include_bytes!("../../../assets/icons/check.svg"),
-                language.text(Text::ApplyAndPlay),
-                DetailMessage::Apply,
+                language.text(Text::Apply),
+                can_apply.then_some(DetailMessage::Apply),
                 primary_button_style,
             ))
             .id("detail.apply-and-play"),
@@ -133,47 +149,61 @@ pub fn view(state: DetailViewState<'_>) -> Element<'_, DetailMessage> {
                 } else {
                     language.text(Text::Pause)
                 },
-                DetailMessage::TogglePlayback,
+                can_apply.then_some(DetailMessage::TogglePlayback),
                 tonal_button_style,
             ))
             .id("detail.toggle-playback"),
             container(icon_action(
                 include_bytes!("../../../assets/icons/stop.svg"),
                 language.text(Text::Stop),
-                DetailMessage::Stop,
+                Some(DetailMessage::Stop),
                 outlined_button_style,
             ))
             .id("detail.stop"),
         ]
-        .spacing(12),
+        .spacing(8),
     )
     .width(Fill)
     .align_x(Horizontal::Right);
 
-    container(
+    let mut identity = row![].spacing(12).align_y(iced::Alignment::Center);
+    if let Some(preview) = &entry.preview {
+        identity = identity.push(
+            image(image::Handle::from_path(preview))
+                .width(92)
+                .height(66)
+                .content_fit(iced::ContentFit::Cover),
+        );
+    }
+    identity = identity.push(
         column![
-            column![text(&entry.title).size(24), text(entry.id.as_str()).size(12)].spacing(4),
-            tabs,
+            text(&entry.title).size(19).color(crate::ui::theme::TEXT),
+            text(entry.id.as_str()).size(12).color(crate::ui::theme::MUTED),
+        ]
+        .spacing(5)
+        .width(Fill),
+    );
+    let mut content = column![identity, tabs].spacing(14);
+    if active_tab == DetailTab::UserProperties && can_apply {
+        content = content.push(properties::toolbar(schema, settings, property_filter, language));
+    }
+    content = content
+        .push(
             scrollable(container(body).padding(iced::Padding {
                 top: 0.0,
-                right: 18.0,
+                right: 12.0,
                 bottom: 0.0,
-                left: 0.0
+                left: 0.0,
             }))
+            .id("detail.body")
             .height(Fill)
             .direction(iced::widget::scrollable::Direction::Vertical(
-                iced::widget::scrollable::Scrollbar::new().width(12).margin(6).scroller_width(6)
+                iced::widget::scrollable::Scrollbar::new().width(12).margin(6).scroller_width(6),
             ))
             .style(scrollbar::md_style),
-            actions,
-        ]
-        .spacing(18),
-    )
-    .width(Fill)
-    .height(Fill)
-    .padding(20)
-    .style(sidebar_style)
-    .into()
+        )
+        .push(actions);
+    container(content).width(Fill).height(Fill).padding(16).style(sidebar_style).into()
 }
 
 fn actions_view<'a>(
@@ -405,7 +435,7 @@ fn tab_button<'a>(
             .style(move |_theme, status| {
                 let selected = tab == active;
                 let background = if selected {
-                    Color::from_rgb8(70, 92, 130)
+                    crate::ui::theme::RAISED
                 } else if matches!(status, button::Status::Hovered) {
                     Color::from_rgb8(48, 50, 55)
                 } else {
@@ -418,7 +448,7 @@ fn tab_button<'a>(
                     } else {
                         Color::from_rgb8(198, 199, 204)
                     },
-                    border: Border { radius: 20.0.into(), ..Default::default() },
+                    border: Border { radius: 6.0.into(), ..Default::default() },
                     ..Default::default()
                 }
             }),
@@ -430,7 +460,7 @@ fn tab_button<'a>(
 fn icon_action<'a>(
     icon: &'static [u8],
     label: &'a str,
-    message: DetailMessage,
+    message: Option<DetailMessage>,
     style: fn(&Theme, button::Status) -> button::Style,
 ) -> iced::widget::Button<'a, DetailMessage> {
     button(
@@ -441,54 +471,60 @@ fn icon_action<'a>(
         .spacing(6)
         .align_y(iced::Alignment::Center),
     )
-    .on_press(message)
-    .height(48)
+    .on_press_maybe(message)
+    .height(40)
     .padding([8, 12])
     .style(style)
 }
 
 fn sidebar_style(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(Color::from_rgb8(30, 31, 34))),
+        background: Some(Background::Color(crate::ui::theme::PANEL)),
         ..Default::default()
     }
 }
 
 pub(crate) fn section_style(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(Color::from_rgb8(39, 40, 44))),
-        border: Border { radius: 16.0.into(), ..Default::default() },
+        background: Some(Background::Color(crate::ui::theme::SURFACE)),
+        border: Border { radius: 8.0.into(), ..Default::default() },
         ..Default::default()
     }
 }
 
 fn primary_button_style(_theme: &Theme, status: button::Status) -> button::Style {
     let background = if matches!(status, button::Status::Hovered) {
-        Color::from_rgb8(175, 199, 255)
+        Color::from_rgb8(218, 222, 230)
     } else {
-        Color::from_rgb8(153, 178, 241)
+        Color::from_rgb8(241, 242, 244)
     };
     button::Style {
         background: Some(Background::Color(background)),
-        text_color: Color::from_rgb8(20, 37, 68),
-        border: Border { radius: 24.0.into(), ..Default::default() },
+        text_color: Color::from_rgb8(20, 21, 24),
+        border: Border { radius: 8.0.into(), ..Default::default() },
         ..Default::default()
     }
 }
 
 fn tonal_button_style(_theme: &Theme, _status: button::Status) -> button::Style {
     button::Style {
-        background: Some(Background::Color(Color::from_rgb8(65, 83, 116))),
-        text_color: Color::from_rgb8(220, 231, 255),
-        border: Border { radius: 24.0.into(), ..Default::default() },
+        background: Some(Background::Color(crate::ui::theme::RAISED)),
+        text_color: crate::ui::theme::TEXT,
+        border: Border { radius: 8.0.into(), ..Default::default() },
         ..Default::default()
     }
 }
 
-pub(crate) fn outlined_button_style(_theme: &Theme, _status: button::Status) -> button::Style {
+pub(crate) fn outlined_button_style(_theme: &Theme, status: button::Status) -> button::Style {
     button::Style {
-        text_color: Color::from_rgb8(198, 210, 242),
-        border: Border { radius: 24.0.into(), width: 1.0, color: Color::from_rgb8(143, 147, 156) },
+        background: matches!(status, button::Status::Hovered)
+            .then_some(Background::Color(crate::ui::theme::RAISED)),
+        text_color: if matches!(status, button::Status::Disabled) {
+            Color::from_rgb8(120, 123, 132)
+        } else {
+            crate::ui::theme::TEXT
+        },
+        border: Border { radius: 6.0.into(), width: 1.0, color: crate::ui::theme::BORDER },
         ..Default::default()
     }
 }
@@ -500,10 +536,10 @@ pub(crate) fn md_text_input_style(
     let border = if matches!(status, iced::widget::text_input::Status::Focused { .. }) {
         Color::from_rgb8(174, 198, 255)
     } else {
-        Color::from_rgb8(143, 147, 156)
+        crate::ui::theme::BORDER
     };
     iced::widget::text_input::Style {
-        background: Background::Color(Color::from_rgb8(43, 44, 48)),
+        background: Background::Color(crate::ui::theme::RAISED),
         border: Border { radius: 8.0.into(), width: 1.0, color: border },
         icon: Color::from_rgb8(196, 199, 204),
         placeholder: Color::from_rgb8(196, 199, 204),
@@ -551,11 +587,7 @@ pub(crate) fn md_pick_list_style(
         border: Border {
             radius: 8.0.into(),
             width: 1.0,
-            color: if focused {
-                Color::from_rgb8(174, 198, 255)
-            } else {
-                Color::from_rgb8(143, 147, 156)
-            },
+            color: if focused { Color::from_rgb8(174, 198, 255) } else { crate::ui::theme::BORDER },
         },
     }
 }

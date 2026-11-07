@@ -2,10 +2,9 @@ use std::path::Path;
 
 use we_core::{
     config::{
-        build_config_for_wallpaper, save_config, save_force_scene_audio_loop,
-        save_integrations_and_rules, save_playlists_profiles_and_outputs,
-        save_profiles_outputs_and_scenes, save_scene_settings, save_wallpapers,
-        save_wallpapers_playlists_profiles_and_outputs, AdaptiveConfig, IntegrationsConfig,
+        save_force_scene_audio_loop, save_integrations_and_rules,
+        save_playlists_profiles_and_outputs, save_profiles_outputs_and_scenes, save_scene_settings,
+        save_wallpaper_launch_settings, save_wallpapers, AdaptiveConfig, IntegrationsConfig,
         LaunchSettings, OutputBinding, RuntimeRulesConfig, SceneConfig,
     },
     playlist::PlaylistConfig,
@@ -18,9 +17,8 @@ pub(crate) fn persist_selected(
     launch_settings: &LaunchSettings,
     entry: &WallpaperEntry,
 ) -> Result<(), String> {
-    let config = build_config_for_wallpaper(launch_settings, &entry.id, &entry.project_json)
-        .map_err(|error| error.to_string())?;
-    save_config(config_path, &config).map_err(|error| error.to_string())
+    save_wallpaper_launch_settings(config_path, launch_settings, &entry.id, &entry.project_json)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn persist_force_scene_audio_loop(
@@ -76,22 +74,9 @@ pub(crate) fn persist_playlists_profiles_and_outputs(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn persist_wallpapers_playlists_profiles_and_outputs(
-    config_path: &Path,
-    wallpapers: &std::collections::BTreeMap<
-        String,
-        we_core::wallpaper::settings::WallpaperSettings,
-    >,
-    playlists: &PlaylistConfig,
-    profiles: &ProfileConfig,
-    outputs: &std::collections::BTreeMap<String, OutputBinding>,
+pub(crate) fn persist_output_launch_settings(
+    path: &Path,
+    settings: &LaunchSettings,
 ) -> Result<(), String> {
-    save_wallpapers_playlists_profiles_and_outputs(
-        config_path,
-        wallpapers,
-        playlists,
-        profiles,
-        outputs,
-    )
-    .map_err(|error| error.to_string())
+    we_core::config::save_output_launch_settings(path, settings).map_err(|error| error.to_string())
 }

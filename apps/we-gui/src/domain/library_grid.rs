@@ -1,6 +1,7 @@
 const GRID_SPACING: f32 = 12.0;
-const GRID_PADDING: f32 = 12.0;
-const TARGET_CARD_WIDTH: f32 = 360.0;
+const GRID_PADDING: f32 = 0.0;
+const TARGET_CARD_WIDTH: f32 = 210.0;
+pub(crate) const CARD_CAPTION_HEIGHT: f32 = 44.0;
 const PLAYLIST_CONTROLS_HEIGHT: f32 = 38.0;
 const OVERSCAN_ROWS: usize = 2;
 pub(crate) const MAX_ANIMATED_PREVIEWS: usize = 8;
@@ -40,7 +41,7 @@ pub(crate) fn grid_window(
         .max(1.0) as usize;
     let card_width =
         ((available_width - GRID_SPACING * cols.saturating_sub(1) as f32) / cols as f32).max(180.0);
-    let card_height = (card_width * 9.0 / 16.0).round();
+    let card_height = (card_width * 9.0 / 16.0).round() + CARD_CAPTION_HEIGHT;
     let controls_height = if playlist_controls { PLAYLIST_CONTROLS_HEIGHT } else { 0.0 };
     let row_pitch = card_height + controls_height + GRID_SPACING;
     let total_rows = total_items.div_ceil(cols);
@@ -134,7 +135,7 @@ mod tests {
         assert!(window.start_row > 7_990);
         assert_eq!(window.start_item, window.start_row * window.cols);
         assert!(window.end_item <= total);
-        assert!(window.visible_item_count() <= 30);
+        assert!(window.visible_item_count() <= 50);
 
         let represented_height = window.top_spacer
             + (window.end_row - window.start_row) as f32 * window.row_pitch

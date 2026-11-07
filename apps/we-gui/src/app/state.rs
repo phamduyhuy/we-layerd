@@ -30,6 +30,7 @@ pub(crate) struct App {
     pub entries: Vec<WallpaperEntry>,
     pub selected_id: Option<String>,
     pub selected_schema: UserPropertySchema,
+    pub selected_content: Option<Result<we_core::wallpaper::ResolvedWallpaper, String>>,
     pub resolution_width: String,
     pub resolution_height: String,
     pub config_path: PathBuf,
@@ -41,6 +42,7 @@ pub(crate) struct App {
     pub show_settings: bool,
     pub sidebar: Option<Sidebar>,
     pub detail_tab: crate::ui::sidebar::detail::DetailTab,
+    pub property_filter: crate::domain::property_search::PropertyFilter,
     pub playback_paused: bool,
     pub playback_running: bool,
     pub search_query: String,
@@ -92,29 +94,88 @@ pub(crate) struct OutputRuntimeState {
     pub(crate) source: String,
     pub(crate) playlist_active: Option<String>,
     pub(crate) playlist_index: Option<usize>,
+    pub(crate) paused: bool,
+    pub(crate) manual_paused: bool,
+    pub(crate) rule_paused: bool,
 }
 
 impl App {
-    pub(crate) fn selected_wallpaper_is_running(&self) -> bool {
+    pub(crate) fn selected_wallpaper_is_paused(&self) -> bool {
+        let Some(id) = &self.selected_id else {
+            return false;
+        };
+        let Some(entry) = self.entries.iter().find(|entry| &entry.id == id) else {
+            return false;
+        };
+        let source = match &self.selected_content {
+            Some(Ok(resolved)) => {
+                Some(resolved.project_json.parent().unwrap().display().to_string())
+            }
+            Some(Err(_)) => None,
+            None if entry.ty != WallpaperType::Preset => {
+                crate::services::wallpaper::playback_source(entry)
+            }
+            None => None,
+        };
+        let Some(source) = source else {
+            return false;
+        };
+        let states = self
+            .runtime_outputs
+            .iter()
+            .filter(|(name, state)| {
+                (self.selected_outputs.is_empty() || self.selected_outputs.contains(*name))
+                    && state.source == source
+            })
+            .map(|(_, state)| state)
+            .collect::<Vec<_>>();
+        if states.is_empty() {
+            self.playback_paused
+        } else {
+            states.iter().all(|state| state.paused || state.manual_paused || state.rule_paused)
+        }
+    }
+
+    pub(crate) fn selected_playback_control(&self) -> Option<&'static str> {
+        self.selected_wallpaper_is_loaded().then(|| {
+            if self.selected_wallpaper_is_paused() {
+                "resume"
+            } else {
+                "pause"
+            }
+        })
+    }
+
+    pub(crate) fn selected_wallpaper_is_loaded(&self) -> bool {
         let Some(selected_id) = self.selected_id.as_deref() else { return false };
         let Some(entry) = self.entries.iter().find(|entry| entry.id == selected_id) else {
             return false;
         };
-        let source = entry.project_json.parent().unwrap_or(&entry.project_json).to_string_lossy();
+        let source = match &self.selected_content {
+            Some(Ok(resolved)) => {
+                Some(resolved.project_json.parent().unwrap().display().to_string())
+            }
+            Some(Err(_)) => None,
+            None if entry.ty != WallpaperType::Preset => {
+                crate::services::wallpaper::playback_source(entry)
+            }
+            None => None,
+        };
+        let Some(source) = source else {
+            return false;
+        };
         if !self.runtime_outputs.is_empty() {
-            return self.playback_running
-                && !self.playback_paused
+            return (self.playback_running || self.playback_paused)
                 && self
                     .runtime_outputs
                     .iter()
                     .filter(|(output, _)| {
                         self.selected_outputs.is_empty() || self.selected_outputs.contains(*output)
                     })
-                    .any(|(_, runtime)| runtime.source == source.as_ref());
+                    .any(|(_, runtime)| runtime.source == source);
         }
-        self.playback_running
-            && !self.playback_paused
-            && self.running_source.as_deref() == Some(source.as_ref())
+        (self.playback_running || self.playback_paused)
+            && self.running_source.as_deref() == Some(source.as_str())
     }
 
     pub(crate) fn shutdown_runtime(&mut self) -> bool {
@@ -166,6 +227,7 @@ pub(crate) enum Message {
     StopPressed,
     SettingsPressed,
     SearchChanged(String),
+    FocusSearch,
     TypeFilterSelected(Option<WallpaperType>),
     PaneResized(pane_grid::ResizeEvent),
     AssetsPathChanged(String),

@@ -21,6 +21,35 @@ const GIF_PREVIEW_MAX_RETAINED_FRAMES: usize = 120;
 const GIF_PREVIEW_MAX_DECODED_FRAMES: usize = 600;
 const GIF_PREVIEW_MAX_DECODED_SOURCE_PIXELS: u64 = 512 * 1024 * 1024;
 
+/// Validate selection before any playback or configuration side effects.
+pub(crate) fn resolve_entry(
+    entry: &WallpaperEntry,
+    language: crate::domain::i18n::Language,
+) -> Result<wallpaper::ResolvedWallpaper, String> {
+    use crate::domain::i18n::Text;
+    use wallpaper::WallpaperType;
+    match entry.ty {
+        WallpaperType::Asset => return Err(language.text(Text::AssetCannotApply).to_string()),
+        WallpaperType::Unknown => return Err(language.text(Text::UnknownCannotApply).to_string()),
+        _ => {}
+    }
+    wallpaper::resolve_wallpaper_source(&entry.project_json)
+        .map_err(|error| format!("{}: {error:#}", language.text(Text::WallpaperCannotApply)))
+}
+
+/// The daemon reports a preset's base source, while profiles retain the selected ID.
+pub(crate) fn playback_source(entry: &WallpaperEntry) -> Option<String> {
+    if !entry.ty.is_playable() {
+        return None;
+    }
+    let project = if entry.ty == wallpaper::WallpaperType::Preset {
+        wallpaper::resolve_wallpaper_source(&entry.project_json).ok()?.project_json
+    } else {
+        entry.project_json.clone()
+    };
+    Some(project.parent().unwrap_or(&project).to_string_lossy().into_owned())
+}
+
 pub async fn scan(workshop_path: String) -> Result<Vec<WallpaperEntry>, String> {
     let root = if workshop_path.trim().is_empty() {
         steam::discover_workshop_wallpaper_root()
@@ -28,7 +57,12 @@ pub async fn scan(workshop_path: String) -> Result<Vec<WallpaperEntry>, String> 
     } else {
         PathBuf::from(workshop_path)
     };
-    wallpaper::scan_workshop_wallpapers(&root).map_err(|error| error.to_string())
+    let scan = wallpaper::scan_workshop_wallpapers_with_warnings(&root)
+        .map_err(|error| error.to_string())?;
+    for warning in &scan.warnings {
+        eprintln!("wallpaper scan: {warning}");
+    }
+    Ok(scan.entries)
 }
 
 pub async fn decode_gif(path: PathBuf) -> Result<Vec<GifFrame>, String> {

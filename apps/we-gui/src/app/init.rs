@@ -13,7 +13,7 @@ use crate::{
         runtime_status::RuntimeStatus,
         scene_editor::SceneEditor,
         settings::{ScaleModeOption, UiSettings},
-        ui_state::Pane,
+        ui_state::{Pane, Sidebar},
     },
     platform::tray,
     services::preferences,
@@ -89,11 +89,15 @@ pub(crate) fn initialize() -> (App, Task<Message>) {
     let profile_name_input = profile_selected.clone().unwrap_or_default();
 
     let scene_editor = SceneEditor::new(&launch_settings);
+    let selected_id =
+        launch_settings.outputs.values().find_map(|binding| binding.wallpaper_id.clone());
+    let sidebar = selected_id.as_ref().map(|_| Sidebar::Detail);
     (
         App {
             entries: Vec::new(),
-            selected_id: None,
+            selected_id,
             selected_schema: UserPropertySchema { entries: Vec::new() },
+            selected_content: None,
             resolution_width: String::new(),
             resolution_height: String::new(),
             config_path,
@@ -103,8 +107,9 @@ pub(crate) fn initialize() -> (App, Task<Message>) {
             launch_settings,
             ui_settings,
             show_settings: false,
-            sidebar: None,
-            detail_tab: DetailTab::Actions,
+            sidebar,
+            detail_tab: DetailTab::UserProperties,
+            property_filter: Default::default(),
             playback_paused: false,
             playback_running: false,
             search_query: String::new(),
@@ -168,15 +173,23 @@ pub(crate) fn initialize() -> (App, Task<Message>) {
                 async { crate::services::autostart::status() },
                 Message::AutostartStatusLoaded,
             ),
-            window::open(window::Settings::default()).1.map(Message::WindowOpened),
+            window::open(window::Settings {
+                size: iced::Size::new(1440.0, 900.0),
+                min_size: Some(iced::Size::new(1040.0, 640.0)),
+                ..window::Settings::default()
+            })
+            .1
+            .map(Message::WindowOpened),
         ]),
     )
 }
 
 pub(crate) fn detect_system_theme() -> Theme {
-    match dark_light::detect() {
-        dark_light::Mode::Light => Theme::Light,
-        dark_light::Mode::Dark => Theme::Dark,
-        dark_light::Mode::Default => Theme::Dark,
-    }
+    // The artwork browser uses dark surfaces; native widget text must use the
+    // same palette even when the desktop changes its system theme.
+    let mut palette = Theme::Dark.palette();
+    palette.background = crate::ui::theme::BACKGROUND;
+    palette.text = crate::ui::theme::TEXT;
+    palette.primary = crate::ui::theme::ACCENT;
+    Theme::custom("we-layerd".to_string(), palette)
 }

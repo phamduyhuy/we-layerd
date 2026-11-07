@@ -78,6 +78,13 @@ fn sidebar_view(app: &App, sidebar: Sidebar) -> Element<'_, Message> {
         {
             Some(entry) => detail::view(detail::DetailViewState {
                 entry,
+                availability: app
+                    .selected_content
+                    .as_ref()
+                    .map(|result| result.as_ref().map(|resolved| resolved.ty).map_err(Clone::clone))
+                    .unwrap_or_else(|| {
+                        Err(app.language.text(Text::SelectWallpaperDetails).to_string())
+                    }),
                 settings: app
                     .launch_settings
                     .wallpapers
@@ -87,8 +94,9 @@ fn sidebar_view(app: &App, sidebar: Sidebar) -> Element<'_, Message> {
                 resolution_width: &app.resolution_width,
                 resolution_height: &app.resolution_height,
                 active_tab: app.detail_tab,
-                is_running: app.selected_wallpaper_is_running(),
-                is_paused: app.playback_paused,
+                property_filter: &app.property_filter,
+                is_running: app.selected_wallpaper_is_loaded(),
+                is_paused: app.selected_wallpaper_is_paused(),
                 outputs: &app.outputs,
                 selected_outputs: &app.selected_outputs,
                 language: app.language,

@@ -97,6 +97,8 @@ pub struct PlaylistCursor {
     random_state: u64,
 }
 
+const MAX_HISTORY: usize = 256;
+
 impl PlaylistCursor {
     pub fn new(item_count: usize, random_seed: u64) -> Self {
         Self {
@@ -117,8 +119,26 @@ impl PlaylistCursor {
             shuffle_remaining: deduplicate_indices(
                 snapshot.shuffle_remaining.into_iter().filter(valid),
             ),
-            history: snapshot.history.into_iter().filter(valid).collect(),
-            forward_history: snapshot.forward_history.into_iter().filter(valid).collect(),
+            history: snapshot
+                .history
+                .into_iter()
+                .rev()
+                .filter(valid)
+                .take(MAX_HISTORY)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
+            forward_history: snapshot
+                .forward_history
+                .into_iter()
+                .rev()
+                .filter(valid)
+                .take(MAX_HISTORY)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
             random_state: normalize_random_state(snapshot.random_state),
         }
     }
@@ -187,7 +207,14 @@ impl PlaylistCursor {
             }
         }?;
 
-        self.history.push(current);
+        if playlist.mode == PlaylistMode::Shuffle {
+            if self.history.len() == MAX_HISTORY {
+                self.history.remove(0);
+            }
+            self.history.push(current);
+        } else {
+            self.history.clear();
+        }
         if !replaying_forward {
             self.forward_history.clear();
         }
@@ -207,6 +234,9 @@ impl PlaylistCursor {
         }?;
 
         if playlist.mode == PlaylistMode::Shuffle {
+            if self.forward_history.len() == MAX_HISTORY {
+                self.forward_history.remove(0);
+            }
             self.forward_history.push(current);
         }
         self.current = Some(previous);
@@ -373,5 +403,29 @@ mod tests {
         let mut restored = PlaylistCursor::restore(playlist.items.len(), snapshot);
         assert_eq!(restored.current_index(), expected_previous);
         assert_eq!(restored.next(&playlist), expected_current);
+    }
+    #[test]
+    fn long_running_playlists_have_bounded_history_and_restore_old_snapshots_safely() {
+        for mode in [PlaylistMode::Repeat, PlaylistMode::Manual, PlaylistMode::Shuffle] {
+            let playlist =
+                Playlist { mode, default_duration_ms: 1000, items: vec![item("a"), item("b")] };
+            let mut cursor = PlaylistCursor::new(2, 42);
+            cursor.start(&playlist);
+            for _ in 0..100_000 {
+                cursor.next(&playlist);
+            }
+            let history = cursor.snapshot().history;
+            if mode == PlaylistMode::Shuffle {
+                assert_eq!(history.len(), super::MAX_HISTORY);
+            } else {
+                assert!(history.is_empty());
+            }
+        }
+        let mut snapshot = PlaylistCursor::new(2, 42).snapshot();
+        snapshot.history = vec![0; 10_000];
+        snapshot.forward_history = vec![1; 10_000];
+        let restored = PlaylistCursor::restore(2, snapshot).snapshot();
+        assert_eq!(restored.history.len(), super::MAX_HISTORY);
+        assert_eq!(restored.forward_history.len(), super::MAX_HISTORY);
     }
 }

@@ -525,6 +525,13 @@ pub fn build_config_for_wallpaper(
     project_json: &Path,
 ) -> Result<AppConfig> {
     let mut config = build_config(settings, project_json);
+    let resolved = project_json
+        .is_file()
+        .then(|| crate::wallpaper::resolve_wallpaper_source(project_json))
+        .transpose()?;
+    if let Some(source) = &resolved {
+        config.renderer.source = source.project_json.parent().unwrap().display().to_string();
+    }
     let wallpaper =
         settings.wallpapers.get(wallpaper_id).cloned().unwrap_or_else(|| WallpaperSettings {
             msaa_samples: settings.msaa_samples.max(1),
@@ -548,9 +555,11 @@ pub fn build_config_for_wallpaper(
             config.renderer.render_height = Some(height.max(1));
         }
     }
+    let mut properties = resolved.map(|source| source.user_properties).unwrap_or_default();
+    properties.extend(wallpaper.user_properties);
     config.renderer.options_json = Some(merge_scene_source_options(
         settings.options_json.as_deref(),
-        Some(wallpaper.user_properties),
+        Some(properties),
         settings.force_scene_audio_loop,
     )?);
     config.wallpapers = settings.wallpapers.clone();
@@ -561,13 +570,93 @@ pub fn build_config_for_wallpaper(
 }
 
 pub fn save_config(path: &Path, config: &AppConfig) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
+    save_config_document(path, &merge_config_document(path, config)?)
+}
 
-    let toml = toml::to_string_pretty(config).context("failed to serialize config")?;
-    fs::write(path, toml).with_context(|| format!("failed to write {}", path.display()))
+pub fn save_wallpaper_launch_settings(
+    path: &Path,
+    settings: &LaunchSettings,
+    wallpaper_id: &str,
+    project_json: &Path,
+) -> Result<()> {
+    let config = build_config_for_wallpaper(settings, wallpaper_id, project_json)?;
+    let mut document = merge_config_document(path, &config)?;
+    document.as_table_mut().context("config must be a table")?.insert(
+        "library".into(),
+        toml::Value::try_from(BTreeMap::from([("workshop_path", &settings.workshop_path)]))?,
+    );
+    save_config_document(path, &document)
+}
+
+fn merge_config_document(path: &Path, config: &AppConfig) -> Result<toml::Value> {
+    let mut document = load_config_document(path)?;
+    let update = toml::Value::try_from(config).context("failed to serialize config")?;
+    let root = document.as_table_mut().context("config must be a table")?;
+    // Replace all owned sections, retaining extension/other-tool sections such as [gnome].
+    for key in [
+        "general",
+        "renderer",
+        "hooks",
+        "wallpapers",
+        "playlists",
+        "outputs",
+        "profiles",
+        "integrations",
+        "rules",
+        "adaptive",
+        "scenes",
+    ] {
+        root.remove(key);
+    }
+    root.extend(update.as_table().context("serialized config must be a table")?.clone());
+    Ok(document)
+}
+
+/// Persist the GUI's global settings and output bindings together without losing daemon-only sections.
+pub fn save_output_launch_settings(path: &Path, settings: &LaunchSettings) -> Result<()> {
+    let mut document = load_config_document(path)?;
+    let root = document.as_table_mut().context("config must be a table")?;
+    let config = build_config(settings, Path::new(""));
+    let general = root
+        .entry("general")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .context("general must be a table")?;
+    let global_general = toml::Value::try_from(&config.general)?;
+    for key in
+        ["backend", "interactive", "input_mode", "show_fps", "scale_mode", "force_scene_audio_loop"]
+    {
+        general.insert(key.into(), global_general[key].clone());
+    }
+    let renderer = root
+        .entry("renderer")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .context("renderer must be a table")?;
+    let global = toml::Value::try_from(&config.renderer)?;
+    for key in [
+        "library_path",
+        "cache_path",
+        "assets_path",
+        "prefer_dmabuf",
+        "allow_shm_fallback",
+        "max_fps",
+        "fps",
+        "msaa_samples",
+    ] {
+        if let Some(value) = global.get(key) {
+            renderer.insert(key.into(), value.clone());
+        }
+    }
+    root.insert("wallpapers".into(), toml::Value::try_from(&settings.wallpapers)?);
+    root.insert("playlists".into(), toml::Value::try_from(&settings.playlists)?);
+    root.insert("profiles".into(), toml::Value::try_from(&settings.profiles)?);
+    root.insert("outputs".into(), toml::Value::try_from(&settings.outputs)?);
+    root.insert(
+        "library".into(),
+        toml::Value::try_from(BTreeMap::from([("workshop_path", &settings.workshop_path)]))?,
+    );
+    save_config_document(path, &document)
 }
 
 pub fn load_launch_settings(path: &Path) -> Result<LaunchSettings> {
@@ -582,7 +671,10 @@ pub fn load_launch_settings(path: &Path) -> Result<LaunchSettings> {
             .unwrap_or_else(|| Path::new(""))
             .display()
             .to_string(),
-        workshop_path: derive_workshop_root(&cfg.renderer.source),
+        workshop_path: toml::from_str::<toml::Value>(&raw)
+            .ok()
+            .and_then(|doc| doc.get("library")?.get("workshop_path")?.as_str().map(str::to_string))
+            .unwrap_or_else(|| derive_workshop_root(&cfg.renderer.source)),
         renderer_library_path: cfg.renderer.library_path,
         renderer_cache_path: cfg.renderer.cache_path,
         prefer_dmabuf: cfg.renderer.prefer_dmabuf,
@@ -634,7 +726,10 @@ pub fn merge_scene_source_options(
         bail!("renderer.options_json scene field must be an object");
     }
     let scene = scene.as_object_mut().expect("scene options are an object");
-    if let Some(user_properties) = user_properties {
+    if let Some(mut user_properties) = user_properties {
+        // Workshop snapshots include null UI/group placeholders (e.g. Pixels' _d0).
+        // Null means no runtime override; it is not accepted by the renderer's value ABI.
+        user_properties.retain(|_, value| !value.is_null());
         scene.insert("userProperties".to_string(), serde_json::json!(user_properties));
     }
 
@@ -1063,6 +1158,17 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn preset_ui_null_placeholders_are_not_forwarded_to_the_renderer() {
+        let properties = std::collections::BTreeMap::from([
+            ("_d0".to_string(), serde_json::Value::Null),
+            ("alignment".to_string(), serde_json::json!(0)),
+        ]);
+        let options = super::merge_scene_source_options(None, Some(properties), false).unwrap();
+        let options: serde_json::Value = serde_json::from_str(&options).unwrap();
+        assert_eq!(options["scene"]["userProperties"], serde_json::json!({"alignment":0}));
     }
 
     #[test]
@@ -1566,5 +1672,77 @@ fullscreen = "pause"
         assert_eq!(value["renderer"]["source"].as_str(), Some("/keep"));
         assert_eq!(value["custom"]["number"].as_integer(), Some(12));
         let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn full_save_preserves_daemon_extensions_and_clears_removed_owned_sections() {
+        let path = unique_temp_path("full-preserve");
+        fs::write(
+            &path,
+            r#"[gnome]
+extension_dbus_name = "custom.bus"
+[hooks.wallpaper_applied]
+command = "old-hook"
+"#,
+        )
+        .unwrap();
+        super::save_config(&path, &super::AppConfig::default()).unwrap();
+        let doc = super::load_config_document(&path).unwrap();
+        assert_eq!(doc["gnome"]["extension_dbus_name"].as_str(), Some("custom.bus"));
+        assert!(doc.get("hooks").is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn output_launch_settings_roundtrip_preserves_live_source_and_daemon_sections() {
+        let path = unique_temp_path("output-global");
+        fs::write(
+            &path,
+            r#"[gnome]
+extension_dbus_name = "custom.bus"
+[general]
+fps_report_interval_secs = 7
+[renderer]
+source = "/wallpapers/current"
+volume = 0.3
+[outputs.DP-1]
+source = "/wallpapers/current"
+"#,
+        )
+        .unwrap();
+        let mut settings = LaunchSettings::default();
+        settings.assets_path = "/opt/new-engine".into();
+        settings.workshop_path = "/mnt/custom/workshop".into();
+        settings.renderer_library_path = "/opt/new-renderer.so".into();
+        settings.renderer_cache_path = "/tmp/new-cache".into();
+        settings.prefer_dmabuf = false;
+        settings.allow_shm_fallback = false;
+        settings.interactive = false;
+        settings.input_mode = super::InputMode::BackgroundProxy;
+        settings.fps_limit = 30;
+        settings.show_fps = true;
+        settings.outputs.insert(
+            "DP-1".into(),
+            super::OutputBinding::wallpaper("current", "/wallpapers/current"),
+        );
+        super::save_output_launch_settings(&path, &settings).unwrap();
+        let loaded = super::load_launch_settings(&path).unwrap();
+        assert_eq!(loaded.fps_limit, 30);
+        assert_eq!(
+            super::load_config_document(&path).unwrap()["general"]["fps_report_interval_secs"]
+                .as_integer(),
+            Some(7)
+        );
+        assert_eq!(loaded.assets_path, settings.assets_path);
+        assert_eq!(loaded.workshop_path, settings.workshop_path);
+        assert_eq!(loaded.renderer_library_path, settings.renderer_library_path);
+        assert_eq!(loaded.renderer_cache_path, settings.renderer_cache_path);
+        assert_eq!(loaded.input_mode, settings.input_mode);
+        assert!(!loaded.prefer_dmabuf && !loaded.allow_shm_fallback && !loaded.interactive);
+        assert!(loaded.show_fps);
+        let doc = super::load_config_document(&path).unwrap();
+        assert_eq!(doc["gnome"]["extension_dbus_name"].as_str(), Some("custom.bus"));
+        assert_eq!(doc["renderer"]["source"].as_str(), Some("/wallpapers/current"));
+        assert_eq!(doc["renderer"]["volume"].as_float(), Some(0.3));
+        fs::remove_file(path).unwrap();
     }
 }
