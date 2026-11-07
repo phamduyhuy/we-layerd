@@ -124,6 +124,16 @@ pub(crate) struct PauseState {
 }
 
 impl PauseState {
+    pub(crate) fn new(manual: bool) -> Self {
+        Self { manual, rule: false }
+    }
+    pub(crate) fn manual(self) -> bool {
+        self.manual
+    }
+    pub(crate) fn rule(self) -> bool {
+        self.rule
+    }
+
     pub(crate) fn set_manual(&mut self, paused: bool) {
         self.manual = paused;
     }

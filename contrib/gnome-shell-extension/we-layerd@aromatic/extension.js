@@ -6,7 +6,7 @@ import {WindowManager} from './windowManager.js';
 
 const BUS_NAME = 'io.github.weLayerd.Gnome';
 const OBJECT_PATH = '/io/github/weLayerd/Gnome';
-const EXTENSION_RUNTIME_VERSION = 'gnome-window-bridge-v5-monitor-connectors';
+const EXTENSION_RUNTIME_VERSION = 'gnome-window-bridge-v7-playback-lifecycle';
 const PROTOCOL_XML_PATH = 'protocol/io.github.weLayerd.Gnome.xml';
 
 function logDebug(message) {
@@ -22,7 +22,9 @@ function loadProtocolXml(dir) {
 export default class WeLayerdExtension extends Extension {
     enable() {
         logDebug('enable()');
-        this._target = null;
+        // The daemon survives extension disable/enable. Recover its existing
+        // native window before rebuilding the background actors and rules.
+        this._target = this._findRendererTarget();
         this._override = new GnomeShellOverride(
             metaWindow => this._shouldHideWindow(metaWindow),
             () => this._target !== null
@@ -30,6 +32,8 @@ export default class WeLayerdExtension extends Extension {
         this._windowManager = new WindowManager(metaWindow => this._shouldManageWindow(metaWindow));
         this._override.enable();
         this._windowManager.enable();
+        if (this._target)
+            this._override.reloadBackgrounds();
 
         this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(loadProtocolXml(this.dir), this);
         this._dbusConnection = Gio.bus_get_sync(Gio.BusType.SESSION, null);
@@ -109,6 +113,7 @@ export default class WeLayerdExtension extends Extension {
             return states;
 
         const focusWindow = global.display.get_focus_window();
+        const workspace = global.workspace_manager.get_active_workspace();
         const monitorManager = global.backend?.get_monitor_manager?.() ?? null;
         const logicalMonitors = monitorManager?.get_logical_monitors?.() ?? [];
         // Meta.Window.get_monitor() reports a logical monitor index. Resolve
@@ -126,7 +131,7 @@ export default class WeLayerdExtension extends Extension {
                 continue;
             if (win.get_window_type?.() !== Meta.WindowType.NORMAL)
                 continue;
-            if (!win.showing_on_its_workspace?.())
+            if (!win.located_on_workspace(workspace) || !win.showing_on_its_workspace?.())
                 continue;
 
             states.push([
@@ -137,6 +142,19 @@ export default class WeLayerdExtension extends Extension {
             ]);
         }
         return states;
+    }
+
+    _findRendererTarget() {
+        for (const win of global.display.list_all_windows()) {
+            const pid = win.get_pid?.() ?? 0;
+            const title = win.get_title?.() ?? '';
+            const wmClass = win.get_wm_class?.() ?? '';
+            if (pid > 0 && wmClass === 'io.github.weLayerd.Renderer' &&
+                title === `we-layerd-renderer-${pid}`) {
+                return {xid: pid, pid, title, wmClass};
+            }
+        }
+        return null;
     }
 
     _shouldManageWindow(metaWindow) {

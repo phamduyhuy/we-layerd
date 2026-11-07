@@ -20,8 +20,8 @@ use super::{
     media::{self, MediaBridgeState},
     power::{detect_power_state, PowerState},
     rules::{
-        policies_for_outputs, ForeignToplevelMonitor, GnomeToplevelMonitor, RuleSet,
-        RuntimePolicy, ToplevelActivity,
+        policies_for_outputs, ForeignToplevelMonitor, GnomeToplevelMonitor, RuleSet, RuntimePolicy,
+        ToplevelActivity,
     },
 };
 
@@ -73,7 +73,7 @@ impl Default for IntegrationState {
             media_player: None,
             media_error: None,
             audio_generation: 0,
-            audio: vec![0.0; AUDIO_SPECTRUM_BINS * 2].into(),
+            audio: Arc::from([]),
             audio_enabled: false,
             audio_available: false,
             audio_source: String::new(),
@@ -233,8 +233,17 @@ impl HostIntegrations {
         error: Option<String>,
     ) {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !available {
-            if state.audio.iter().any(|sample| *sample != 0.0) {
+        if !enabled {
+            // An empty external buffer lets the renderer resume native capture.
+            // A full zero spectrum would continue overriding it after disabling.
+            if !state.audio.is_empty() {
+                state.audio = Arc::from([]);
+                state.audio_generation = state.audio_generation.wrapping_add(1);
+            }
+        } else if !available {
+            if state.audio.len() != AUDIO_SPECTRUM_BINS * 2
+                || state.audio.iter().any(|sample| *sample != 0.0)
+            {
                 state.audio = Arc::from(vec![0.0_f32; AUDIO_SPECTRUM_BINS * 2]);
                 state.audio_generation = state.audio_generation.wrapping_add(1);
             }
@@ -892,8 +901,9 @@ fn spawn_rule_collector(
 
                 if monitor.is_none() {
                     let connect_result = match &gnome_bus_name {
-                        Some(bus_name) => GnomeToplevelMonitor::connect(bus_name)
-                            .map(ToplevelMonitor::Gnome),
+                        Some(bus_name) => {
+                            GnomeToplevelMonitor::connect(bus_name).map(ToplevelMonitor::Gnome)
+                        }
                         None => ForeignToplevelMonitor::connect().map(ToplevelMonitor::Foreign),
                     };
                     match connect_result {
@@ -1063,8 +1073,81 @@ mod tests {
         );
         let after = host.snapshot_for_output("DP-1");
 
+        assert_eq!(after.audio.len(), AUDIO_SPECTRUM_BINS * 2);
         assert!(after.audio.iter().all(|sample| *sample == 0.0));
         assert_ne!(after.audio_generation, before.audio_generation);
+    }
+
+    #[test]
+    fn disabled_audio_releases_external_buffer_even_after_silence() {
+        for amplitude in [0.0, 0.5] {
+            let host = HostIntegrations::default();
+            host.update_audio(
+                true,
+                true,
+                "monitor".to_string(),
+                Some(Arc::from(vec![amplitude; AUDIO_SPECTRUM_BINS * 2])),
+                None,
+            );
+            let before = host.snapshot_for_output("DP-1");
+            host.update_audio(false, false, "monitor".to_string(), None, None);
+            let disabled = host.snapshot_for_output("DP-1");
+            assert!(disabled.audio.is_empty(), "disabled must release native fallback");
+            assert_eq!(disabled.audio_generation, before.audio_generation.wrapping_add(1));
+
+            host.update_audio(false, false, "monitor".to_string(), None, None);
+            assert_eq!(
+                host.snapshot_for_output("DP-1").audio_generation,
+                disabled.audio_generation
+            );
+
+            // Enabling without capture must restore a full silent external buffer.
+            host.update_audio(true, false, "monitor".to_string(), None, Some("offline".into()));
+            let unavailable = host.snapshot_for_output("DP-1");
+            assert_eq!(unavailable.audio.len(), AUDIO_SPECTRUM_BINS * 2);
+            assert!(unavailable.audio.iter().all(|value| *value == 0.0));
+            assert_eq!(unavailable.audio_generation, disabled.audio_generation.wrapping_add(1));
+            host.update_audio(true, false, "monitor".to_string(), None, Some("offline".into()));
+            assert_eq!(
+                host.snapshot_for_output("DP-1").audio_generation,
+                unavailable.audio_generation
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_audio_starts_empty_and_ignores_late_worker_samples() {
+        let host = HostIntegrations::default();
+        assert!(host.snapshot_for_output("DP-1").audio.is_empty());
+        let mut supervisor = AudioSupervisorState::default();
+        let now = Instant::now();
+        let mut config =
+            IntegrationsConfig { audio_spectrum: true, ..IntegrationsConfig::default() };
+        let (generation, _) = supervisor.reconcile(&config, now, &host).unwrap();
+        supervisor.apply_event(
+            AudioWorkerEvent::Samples {
+                generation,
+                samples: Arc::from(vec![0.5; AUDIO_SPECTRUM_BINS * 2]),
+            },
+            now,
+            &host,
+        );
+        let before = host.snapshot_for_output("DP-1");
+        config.audio_spectrum = false;
+        assert!(supervisor.reconcile(&config, now, &host).is_none());
+        let disabled = host.snapshot_for_output("DP-1");
+        assert!(disabled.audio.is_empty());
+        assert_eq!(disabled.audio_generation, before.audio_generation.wrapping_add(1));
+        supervisor.apply_event(
+            AudioWorkerEvent::Samples {
+                generation,
+                samples: Arc::from(vec![0.9; AUDIO_SPECTRUM_BINS * 2]),
+            },
+            now,
+            &host,
+        );
+        assert!(host.snapshot_for_output("DP-1").audio.is_empty());
+        assert_eq!(host.snapshot_for_output("DP-1").audio_generation, disabled.audio_generation);
     }
 
     #[test]

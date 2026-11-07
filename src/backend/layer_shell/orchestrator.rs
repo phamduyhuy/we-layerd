@@ -113,6 +113,31 @@ fn build_output_spec(base: &Config, output_name: &str) -> Result<Option<OutputSp
     Ok(Some(OutputSpec { output_name: output_name.to_string(), config, binding, fingerprint }))
 }
 
+/// Validate selections before a switch replaces a healthy configuration.
+pub(crate) fn validate_output_sources(config: &Config) -> Result<()> {
+    for output in config.outputs.keys() {
+        build_output_spec(config, output)?;
+    }
+    let project = Path::new(&config.renderer.source).join("project.json");
+    if project.is_file() {
+        we_core::wallpaper::resolve_wallpaper_source(&project)?;
+    }
+    Ok(())
+}
+
+fn reconcile_workers_preserving_errors(
+    current: &BTreeMap<String, String>,
+    desired: &BTreeMap<String, OutputSpec>,
+    errors: &BTreeMap<String, String>,
+) -> Vec<OutputAction> {
+    reconcile_workers(current, desired)
+        .into_iter()
+        .filter(
+            |action| !matches!(action,OutputAction::Stop(output) if errors.contains_key(output)),
+        )
+        .collect()
+}
+
 fn fingerprint_output_config(config: &Config, binding: &OutputBinding) -> Result<String> {
     let mut effective = config.clone();
     effective.outputs.clear();
@@ -387,7 +412,7 @@ fn reconcile_live_workers(
         .collect::<BTreeMap<_, _>>();
     apply_start_retry_backoff(&mut current, &desired, failed_start_retries, now);
 
-    for action in reconcile_workers(&current, &desired) {
+    for action in reconcile_workers_preserving_errors(&current, &desired, &spec_errors) {
         match action {
             OutputAction::Stop(output) => {
                 failed_start_retries.remove(&output);
@@ -409,6 +434,7 @@ fn reconcile_live_workers(
                     match spawn_worker(
                         spec,
                         ctx.shutdown_requested.clone(),
+                        ctx.manual_pause.clone(),
                         ctx.host_integrations.clone(),
                         worker_event_tx.clone(),
                     ) {
@@ -435,6 +461,7 @@ fn reconcile_live_workers(
                     match spawn_worker(
                         spec,
                         ctx.shutdown_requested.clone(),
+                        ctx.manual_pause.clone(),
                         ctx.host_integrations.clone(),
                         worker_event_tx.clone(),
                     ) {
@@ -501,6 +528,7 @@ fn report_output_error(ctx: &mut BackendContext<'_>, output: &str, error: String
 fn spawn_worker(
     spec: OutputSpec,
     shutdown_requested: Arc<AtomicBool>,
+    manual_pause: Arc<AtomicBool>,
     host_integrations: crate::runtime::integrations::HostIntegrations,
     worker_event_tx: mpsc::Sender<WorkerExit>,
 ) -> Result<OutputWorker> {
@@ -508,6 +536,12 @@ fn spawn_worker(
     let instance_id = WORKER_INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let mut initial_config = spec.config.clone();
     let playlist_runtime = prepare_output_playlist(&spec, &mut initial_config)?;
+    let mut playlist_runtime = playlist_runtime;
+    if manual_pause.load(Ordering::Relaxed) {
+        if let Some(runtime) = playlist_runtime.as_mut() {
+            runtime.pause(Instant::now());
+        }
+    }
     let playlist_runtime = Arc::new(Mutex::new(playlist_runtime));
     let desired_cfg = Arc::new(Mutex::new(initial_config));
     let (control_tx, control_rx) = mpsc::channel::<ControlCommand>();
@@ -551,6 +585,7 @@ fn spawn_worker(
                     cfg: &config,
                     desired_cfg: worker_desired_cfg.clone(),
                     shutdown_requested: worker_shutdown.clone(),
+                    manual_pause: manual_pause.clone(),
                     host_integrations: worker_host_integrations.clone(),
                     control_rx: &control_rx,
                     output_playlist_rx: None,
@@ -1008,6 +1043,40 @@ mod tests {
             reconcile_workers(&current, &next),
             vec![OutputAction::Stop("DP-1".to_string()), OutputAction::Start("eDP-1".to_string()),]
         );
+    }
+
+    #[test]
+    fn vanished_preset_dependency_keeps_a_live_output_but_unplug_still_stops_it() {
+        let suffix =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("we-output-dependency-{suffix}"));
+        std::fs::create_dir_all(root.join("100")).unwrap();
+        std::fs::create_dir_all(root.join("200")).unwrap();
+        std::fs::write(root.join("100/project.json"), r#"{"type":"scene"}"#).unwrap();
+        std::fs::write(root.join("200/project.json"), r#"{"dependency":"100","preset":{}}"#)
+            .unwrap();
+        let mut config = Config::default();
+        config.outputs.insert(
+            "DP-1".into(),
+            OutputBinding::wallpaper("200", root.join("200").display().to_string()),
+        );
+        let initial = build_output_specs(&config, &["DP-1".into()]).unwrap();
+        let current =
+            initial.iter().map(|(name, spec)| (name.clone(), spec.fingerprint.clone())).collect();
+        std::fs::remove_file(root.join("100/project.json")).unwrap();
+        let (desired, errors) = build_output_specs_with_errors(&config, &["DP-1".into()]);
+        assert!(errors.contains_key("DP-1"));
+        assert!(super::reconcile_workers_preserving_errors(&current, &desired, &errors).is_empty());
+        std::fs::remove_dir_all(root.join("200")).unwrap();
+        let (desired, errors) = build_output_specs_with_errors(&config, &["DP-1".into()]);
+        assert!(errors.contains_key("DP-1"));
+        assert!(super::reconcile_workers_preserving_errors(&current, &desired, &errors).is_empty());
+        let (desired, errors) = build_output_specs_with_errors(&config, &[]);
+        assert_eq!(
+            super::reconcile_workers_preserving_errors(&current, &desired, &errors),
+            vec![OutputAction::Stop("DP-1".into())]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -1,12 +1,17 @@
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, ErrorKind, Read, Write},
     net::Shutdown,
     os::fd::AsRawFd,
     os::unix::net::{SocketAddr, UnixListener, UnixStream},
     path::{Path, PathBuf},
     sync::mpsc::Sender,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     thread,
+    time::{Duration, Instant},
 };
 
 #[cfg(target_os = "linux")]
@@ -194,6 +199,75 @@ impl ControlRequest {
     }
 }
 
+const IPC_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CLIENTS: usize = 16;
+
+fn peer_uid_allowed(peer: u32, owner: u32) -> bool {
+    peer == owner
+}
+
+fn authenticate_peer(stream: &UnixStream) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of_val(&credentials) as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut credentials as *mut _ as *mut libc::c_void,
+                &mut length,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if length as usize != std::mem::size_of_val(&credentials)
+            || !peer_uid_allowed(credentials.uid, unsafe { libc::geteuid() })
+        {
+            return Err(io::Error::new(ErrorKind::PermissionDenied, "IPC peer UID mismatch"));
+        }
+    }
+    Ok(())
+}
+
+fn read_message(stream: &mut UnixStream, limit: usize, timeout: Duration) -> io::Result<String> {
+    let deadline = Instant::now() + timeout;
+    let mut bytes = Vec::new();
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(ErrorKind::TimedOut, "IPC read deadline exceeded"))?;
+        stream.set_read_timeout(Some(remaining))?;
+        let mut buffer = [0; 4096];
+        match stream.read(&mut buffer) {
+            Ok(0) => {
+                return String::from_utf8(bytes)
+                    .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
+            }
+            Ok(count) => {
+                if bytes.len() + count > limit {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "IPC message too large"));
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+struct ClientSlot(Arc<AtomicUsize>);
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub struct ControlServer {
     socket_path: Option<PathBuf>,
     _instance_lock: fs::File,
@@ -219,88 +293,123 @@ impl ControlServer {
         let endpoint = default_endpoint()?;
         let listener = bind_listener(&endpoint)?;
         let socket_path = endpoint.socket_path();
-        let status_provider = std::sync::Arc::new(status_provider);
-        let command_handler = std::sync::Arc::new(command_handler);
-        let switch_config_handler = std::sync::Arc::new(switch_config_handler);
-        let playlist_handler = std::sync::Arc::new(playlist_handler);
-        let profile_handler = std::sync::Arc::new(profile_handler);
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else {
-                    continue;
-                };
-                let mut buf = String::new();
-                if stream.read_to_string(&mut buf).is_err() {
-                    continue;
-                }
-                let Some(request) = ControlRequest::parse(&buf) else {
-                    let _ = stream.write_all(b"ERR unknown command\n");
-                    continue;
-                };
-                match request {
-                    ControlRequest::Status => {
-                        let status = status_provider();
-                        let _ = stream.write_all(status.as_bytes());
-                    }
-                    ControlRequest::SwitchConfig(path) => match switch_config_handler(&path, false)
-                    {
-                        Ok(()) => {
-                            let _ = stream.write_all(b"OK\n");
-                        }
-                        Err(err) => {
-                            let _ = stream.write_all(format!("ERR {err}\n").as_bytes());
-                        }
-                    },
-                    ControlRequest::ReloadSceneConfig(path) => {
-                        match switch_config_handler(&path, true) {
-                            Ok(()) => {
-                                let _ = stream.write_all(b"OK\n");
-                            }
-                            Err(err) => {
-                                let _ = stream.write_all(format!("ERR {err}\n").as_bytes());
-                            }
-                        }
-                    }
-                    ControlRequest::Playlist(command) => match playlist_handler(command) {
-                        Ok(()) => {
-                            let _ = stream.write_all(b"OK\n");
-                        }
-                        Err(err) => {
-                            let _ = stream.write_all(format!("ERR {err}\n").as_bytes());
-                        }
-                    },
-                    ControlRequest::Profile(command) => match profile_handler(command) {
-                        Ok(()) => {
-                            let _ = stream.write_all(b"OK\n");
-                        }
-                        Err(err) => {
-                            let _ = stream.write_all(format!("ERR {err}\n").as_bytes());
-                        }
-                    },
-                    ControlRequest::Command(cmd) => {
-                        match command_handler(cmd) {
-                            Ok(true) => {
-                                let _ = stream.write_all(b"OK\n");
-                                continue;
-                            }
-                            Ok(false) => {}
-                            Err(err) => {
-                                let _ = stream.write_all(format!("ERR {err}\n").as_bytes());
-                                continue;
-                            }
-                        }
-                        if tx.send(cmd).is_ok() {
-                            let _ = stream.write_all(b"OK\n");
-                        } else {
-                            let _ = stream.write_all(b"ERR daemon not running\n");
-                        }
-                    }
-                }
-            }
-        });
+        spawn_listener(
+            listener,
+            tx,
+            status_provider,
+            command_handler,
+            switch_config_handler,
+            playlist_handler,
+            profile_handler,
+        );
 
         Ok(Self { socket_path, _instance_lock: instance_lock })
     }
+}
+
+fn spawn_listener<F, H, S, P, R>(
+    listener: UnixListener,
+    tx: Sender<ControlCommand>,
+    status_provider: F,
+    command_handler: H,
+    switch_config_handler: S,
+    playlist_handler: P,
+    profile_handler: R,
+) where
+    F: Fn() -> String + Send + Sync + 'static,
+    H: Fn(ControlCommand) -> Result<bool> + Send + Sync + 'static,
+    S: Fn(&Path, bool) -> Result<()> + Send + Sync + 'static,
+    P: Fn(PlaylistCommand) -> Result<()> + Send + Sync + 'static,
+    R: Fn(ProfileCommand) -> Result<()> + Send + Sync + 'static,
+{
+    let status_provider = std::sync::Arc::new(status_provider);
+    let command_handler = std::sync::Arc::new(command_handler);
+    let switch_config_handler = std::sync::Arc::new(switch_config_handler);
+    let playlist_handler = std::sync::Arc::new(playlist_handler);
+    let profile_handler = std::sync::Arc::new(profile_handler);
+    let clients = Arc::new(AtomicUsize::new(0));
+    // Keep mutations ordered while slow request/response I/O stays outside this lock.
+    let dispatch = Arc::new(Mutex::new(()));
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            if authenticate_peer(&stream).is_err() {
+                continue;
+            }
+            if clients
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    (count < MAX_CLIENTS).then_some(count + 1)
+                })
+                .is_err()
+            {
+                continue;
+            }
+            let slot = ClientSlot(clients.clone());
+            let status_provider = status_provider.clone();
+            let command_handler = command_handler.clone();
+            let switch_config_handler = switch_config_handler.clone();
+            let playlist_handler = playlist_handler.clone();
+            let profile_handler = profile_handler.clone();
+            let tx = tx.clone();
+            let dispatch = dispatch.clone();
+            let _ = thread::Builder::new().name("we-layerd-ipc".into()).spawn(move || {
+                let _slot = slot;
+                let _ = stream.set_write_timeout(Some(IPC_TIMEOUT));
+                let buf = match read_message(&mut stream, MAX_REQUEST_BYTES, IPC_TIMEOUT) {
+                    Ok(buf) => buf,
+                    Err(_) => {
+                        let _ = stream.write_all(b"ERR invalid or timed out request\n");
+                        return;
+                    }
+                };
+                let Some(request) = ControlRequest::parse(&buf) else {
+                    let _ = stream.write_all(b"ERR unknown command\n");
+                    return;
+                };
+                let response = {
+                    let Ok(_dispatch) = dispatch.lock() else {
+                        return;
+                    };
+                    let result = match request {
+                        ControlRequest::Status => None,
+                        ControlRequest::SwitchConfig(ref path) => {
+                            Some(switch_config_handler(path, false))
+                        }
+                        ControlRequest::ReloadSceneConfig(ref path) => {
+                            Some(switch_config_handler(path, true))
+                        }
+                        ControlRequest::Playlist(ref command) => {
+                            Some(playlist_handler(command.clone()))
+                        }
+                        ControlRequest::Profile(ref command) => {
+                            Some(profile_handler(command.clone()))
+                        }
+                        ControlRequest::Command(command) => {
+                            Some(command_handler(command).and_then(|handled| {
+                                if handled {
+                                    Ok(())
+                                } else {
+                                    tx.send(command).context("daemon not running")
+                                }
+                            }))
+                        }
+                    };
+                    match result {
+                        None => status_provider(),
+                        Some(Ok(())) => "OK\n".to_string(),
+                        Some(Err(error)) => format!("ERR {error}\n"),
+                    }
+                };
+                if response.len() <= MAX_RESPONSE_BYTES {
+                    let _ = stream.write_all(response.as_bytes());
+                } else {
+                    let _ = stream.write_all(b"ERR response too large\n");
+                }
+            });
+        }
+    });
 }
 
 impl Drop for ControlServer {
@@ -364,12 +473,20 @@ fn send_request(request: &str) -> Result<String> {
     for endpoint in control_endpoints() {
         match connect_stream(&endpoint) {
             Ok(mut stream) => {
+                authenticate_peer(&stream).context("untrusted IPC server")?;
+                stream.set_write_timeout(Some(IPC_TIMEOUT))?;
+                if request.len() > MAX_REQUEST_BYTES {
+                    return Err(anyhow!("IPC request too large"));
+                }
                 stream
                     .write_all(request.as_bytes())
                     .with_context(|| format!("failed to send IPC request '{request}'"))?;
                 let _ = stream.shutdown(Shutdown::Write);
-                let mut response = String::new();
-                stream.read_to_string(&mut response).context("failed to read IPC response")?;
+                let response = read_message(&mut stream, MAX_RESPONSE_BYTES, IPC_TIMEOUT)
+                    .context("failed to read IPC response")?;
+                if response.trim().is_empty() {
+                    return Err(anyhow!("IPC server closed without a response"));
+                }
                 return Ok(response);
             }
             Err(err) => {
@@ -601,5 +718,66 @@ mod tests {
             Some(ControlRequest::Profile(ProfileCommand::Apply("Desk Setup".to_string())))
         );
         assert_eq!(ControlRequest::parse("profile apply    "), None);
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn uid_authentication_rejects_other_users_and_accepts_socket_peer() {
+        assert!(peer_uid_allowed(1000, 1000));
+        assert!(!peer_uid_allowed(1001, 1000));
+        let (peer, _) = UnixStream::pair().unwrap();
+        authenticate_peer(&peer).unwrap();
+    }
+
+    #[test]
+    fn read_has_size_and_total_time_limits() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"too long").unwrap();
+        assert_eq!(
+            read_message(&mut reader, 4, Duration::from_secs(1)).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        let (mut reader, _writer) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        assert!(read_message(&mut reader, 4, Duration::from_millis(30)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn idle_client_does_not_block_status_or_commands() {
+        use std::sync::atomic::AtomicU64;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "we-layerd-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let addr = SocketAddr::from_abstract_name(name).unwrap();
+        let listener = UnixListener::bind_addr(&addr).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_listener(
+            listener,
+            tx,
+            || "test-status".into(),
+            |_| Ok(false),
+            |_, _| Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+        );
+        let _idle = UnixStream::connect_addr(&addr).unwrap();
+        let request = |text: &[u8]| {
+            let mut stream = UnixStream::connect_addr(&addr).unwrap();
+            stream.write_all(text).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            read_message(&mut stream, MAX_RESPONSE_BYTES, Duration::from_secs(1)).unwrap()
+        };
+        assert_eq!(request(b"status"), "test-status");
+        assert_eq!(request(b"pause"), "OK\n");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), ControlCommand::Pause);
     }
 }

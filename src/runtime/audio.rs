@@ -14,6 +14,10 @@ use libpulse_binding::{
 };
 
 pub(crate) const AUDIO_SPECTRUM_BINS: usize = 64;
+const AUDIO_FFT_SIZE: usize = 4096;
+// Float capture can legitimately exceed unity after per-capture gain. Reserve
+// arithmetic headroom for the FFT and response gain only at extreme magnitudes.
+const MAX_PCM_MAGNITUDE: f32 = f32::MAX / (AUDIO_FFT_SIZE * AUDIO_FFT_SIZE) as f32;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StereoSpectrum {
@@ -37,55 +41,115 @@ pub(crate) fn spectrum_from_interleaved_pcm(samples: &[f32], sample_rate: u32) -
         return StereoSpectrum { left, right };
     }
 
-    let frame_count = (samples.len() / 2).min(4096);
-    if frame_count < 2 {
-        return StereoSpectrum { left, right };
-    }
+    let frame_count = (samples.len() / 2).min(AUDIO_FFT_SIZE);
     let start_frame = samples.len() / 2 - frame_count;
     let mut window_sum = 0.0_f32;
-    let mut window = Vec::with_capacity(frame_count);
+    // Zero-pad shorter capture windows. Work and storage stay bounded even if
+    // the caller supplies a backlog; only the latest complete stereo frames count.
+    let mut left_fft = vec![[0.0_f32; 2]; AUDIO_FFT_SIZE];
+    let mut right_fft = vec![[0.0_f32; 2]; AUDIO_FFT_SIZE];
     for index in 0..frame_count {
         let phase = std::f32::consts::TAU * index as f32 / (frame_count - 1) as f32;
-        let value = 0.5 - 0.5 * phase.cos();
-        window.push(value);
-        window_sum += value;
+        let weight = 0.5 - 0.5 * phase.cos();
+        window_sum += weight;
+        for (channel, fft) in [&mut left_fft, &mut right_fft].into_iter().enumerate() {
+            let sample = samples[(start_frame + index) * 2 + channel];
+            fft[index][0] = if sample.is_finite() {
+                sample.clamp(-MAX_PCM_MAGNITUDE, MAX_PCM_MAGNITUDE) * weight
+            } else {
+                0.0
+            };
+        }
     }
     if window_sum <= f32::EPSILON {
         return StereoSpectrum { left, right };
     }
 
-    let nyquist = sample_rate as f32 * 0.5;
-    for exported_bin in 0..AUDIO_SPECTRUM_BINS {
-        let frequency = nyquist * exported_bin as f32 / AUDIO_SPECTRUM_BINS as f32;
-        let omega = std::f32::consts::TAU * frequency / sample_rate as f32;
-        let coefficient = 2.0 * omega.cos();
-        let mut left_prev = 0.0_f32;
-        let mut left_prev2 = 0.0_f32;
-        let mut right_prev = 0.0_f32;
-        let mut right_prev2 = 0.0_f32;
+    fft_in_place(&mut left_fft);
+    fft_in_place(&mut right_fft);
 
-        for (offset, weight) in window.iter().copied().enumerate() {
-            let frame = start_frame + offset;
-            let left_sample = samples[frame * 2] * weight;
-            let right_sample = samples[frame * 2 + 1] * weight;
-            let left_current = left_sample + coefficient * left_prev - left_prev2;
-            left_prev2 = left_prev;
-            left_prev = left_current;
-            let right_current = right_sample + coefficient * right_prev - right_prev2;
-            right_prev2 = right_prev;
-            right_prev = right_current;
+    // Match the native renderer's 20 Hz..20 kHz Mel bands, tilt and dB
+    // response. Every FFT bin in a band participates, including off-bin music.
+    let sample_rate = sample_rate as f32;
+    let max_hz = 20_000.0_f32.min(sample_rate * 0.5);
+    let to_mel = |hz: f32| 2595.0 * (1.0 + hz / 700.0).log10();
+    let min_mel = to_mel(20.0_f32.min(max_hz));
+    let max_mel = to_mel(max_hz);
+    let upper_bin = |hz: f32| {
+        ((hz * AUDIO_FFT_SIZE as f32 / sample_rate).ceil() as usize).clamp(1, AUDIO_FFT_SIZE / 2)
+    };
+    let max_bin = upper_bin(max_hz);
+    let mut edges = [0; AUDIO_SPECTRUM_BINS + 1];
+    edges[0] = upper_bin(20.0_f32.min(max_hz));
+    for band in 1..AUDIO_SPECTRUM_BINS {
+        let mel = min_mel + (max_mel - min_mel) * band as f32 / AUDIO_SPECTRUM_BINS as f32;
+        let hz = 700.0 * (10.0_f32.powf(mel / 2595.0) - 1.0);
+        // Reserve a bin for each remaining band at supported capture rates.
+        // Degenerate rates may share edges, but must never underflow or reverse.
+        let limit = max_bin.saturating_sub(AUDIO_SPECTRUM_BINS - band).max(edges[band - 1]);
+        edges[band] = upper_bin(hz).max(edges[band - 1] + 1).min(limit);
+    }
+    edges[AUDIO_SPECTRUM_BINS] = max_bin;
+    for band in 0..AUDIO_SPECTRUM_BINS {
+        let begin = edges[band];
+        let end = edges[band + 1];
+        let center_hz = 0.5 * (begin + end) as f32 * sample_rate / AUDIO_FFT_SIZE as f32;
+        let gain = (center_hz / 200.0).powf(0.30);
+        for (output, fft) in [(&mut left, &left_fft), (&mut right, &right_fft)] {
+            let peak = fft[begin..end]
+                .iter()
+                .map(|value| value[0].hypot(value[1]))
+                .fold(0.0_f32, f32::max);
+            let magnitude = peak * (2.0 / window_sum) * gain;
+            let db = 20.0 * magnitude.max(1.0e-12).log10();
+            let unit = ((db + 80.0) / 72.0).clamp(0.0, 1.0);
+            output[band] = if unit <= 0.5 {
+                0.5 * (unit * 2.0).powf(1.6)
+            } else {
+                1.0 - 0.5 * ((1.0 - unit) * 2.0).powf(1.6)
+            };
         }
-
-        let normalize = 2.0 / window_sum;
-        let left_power =
-            left_prev2 * left_prev2 + left_prev * left_prev - coefficient * left_prev * left_prev2;
-        let right_power = right_prev2 * right_prev2 + right_prev * right_prev
-            - coefficient * right_prev * right_prev2;
-        left[exported_bin] = (left_power.max(0.0).sqrt() * normalize).clamp(0.0, 1.0);
-        right[exported_bin] = (right_power.max(0.0).sqrt() * normalize).clamp(0.0, 1.0);
     }
 
     StereoSpectrum { left, right }
+}
+
+// Radix-2 FFT using [real, imaginary] pairs; no extra DSP dependency.
+fn fft_in_place(values: &mut [[f32; 2]]) {
+    let count = values.len();
+    let mut reversed = 0;
+    for index in 1..count {
+        let mut bit = count >> 1;
+        while reversed & bit != 0 {
+            reversed ^= bit;
+            bit >>= 1;
+        }
+        reversed ^= bit;
+        if index < reversed {
+            values.swap(index, reversed);
+        }
+    }
+    let mut length = 2;
+    while length <= count {
+        let angle = -std::f32::consts::TAU / length as f32;
+        let (step_im, step_re) = angle.sin_cos();
+        for begin in (0..count).step_by(length) {
+            let (mut weight_re, mut weight_im) = (1.0, 0.0);
+            for index in 0..length / 2 {
+                let even = values[begin + index];
+                let odd = values[begin + index + length / 2];
+                let odd_re = odd[0] * weight_re - odd[1] * weight_im;
+                let odd_im = odd[0] * weight_im + odd[1] * weight_re;
+                values[begin + index] = [even[0] + odd_re, even[1] + odd_im];
+                values[begin + index + length / 2] = [even[0] - odd_re, even[1] - odd_im];
+                (weight_re, weight_im) = (
+                    weight_re * step_re - weight_im * step_im,
+                    weight_re * step_im + weight_im * step_re,
+                );
+            }
+        }
+        length *= 2;
+    }
 }
 
 fn append_recent_pcm_bytes(retained: &mut Vec<f32>, bytes: &[u8], max_samples: usize) {
@@ -331,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn sine_energy_is_concentrated_near_its_expected_frequency_bin() {
+    fn sine_energy_is_concentrated_near_its_expected_mel_band() {
         let sample_rate = 48_000;
         let spectrum =
             spectrum_from_interleaved_pcm(&stereo_sine(1_500.0, sample_rate, 2048), sample_rate);
@@ -343,10 +407,119 @@ mod tests {
             .map(|(index, _)| index)
             .expect("spectrum has bins");
 
-        // The 64 exported bins cover 0..Nyquist linearly, so 1.5 kHz lands near bin 4.
-        assert!((3..=5).contains(&peak), "unexpected 1.5 kHz peak bin {peak}");
+        // In the native 20 Hz..20 kHz Mel layout, bands 20..23 span roughly
+        // 1.27..1.74 kHz. These bounds are independent of the analyzer code.
+        assert!((20..=23).contains(&peak), "unexpected 1.5 kHz peak band {peak}");
         assert!(spectrum.left[peak] > 0.5);
         assert!((spectrum.left[peak] - spectrum.right[peak]).abs() < 0.001);
+    }
+
+    #[test]
+    fn quiet_off_bin_bass_and_voice_have_visible_separate_stereo_responses() {
+        for frames in [800, 1600, 4096] {
+            let pcm = (0..frames)
+                .flat_map(|index| {
+                    let time = index as f32 / 48_000.0;
+                    [0.02 * (TAU * 110.0 * time).sin(), 0.02 * (TAU * 440.0 * time).sin()]
+                })
+                .collect::<Vec<_>>();
+            let spectrum = spectrum_from_interleaved_pcm(&pcm, 48_000);
+            // Bass is in the first few Mel bands; 440 Hz is near band 8.
+            let bass = spectrum.left[1..=3].iter().copied().fold(0.0_f32, f32::max);
+            let voice = spectrum.right[7..=10].iter().copied().fold(0.0_f32, f32::max);
+            assert!(bass > 0.45, "{frames} frames: quiet bass response {bass}");
+            assert!(voice > 0.45, "{frames} frames: quiet voice response {voice}");
+            assert!(spectrum.right[1..=3].iter().all(|value| *value < bass * 0.5));
+            assert!(spectrum.left[7..=10].iter().all(|value| *value < voice * 0.5));
+        }
+    }
+
+    #[test]
+    fn quiet_broadband_audio_lights_up_most_bands_without_channel_crosstalk() {
+        let mut random = 0x1234_5678_u32;
+        let pcm = (0..4096)
+            .flat_map(|_| {
+                random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (random as f64 / u32::MAX as f64 * 2.0 - 1.0) as f32;
+                [noise * 0.02, 0.0]
+            })
+            .collect::<Vec<_>>();
+        let spectrum = spectrum_from_interleaved_pcm(&pcm, 48_000);
+        let visible = spectrum.left.iter().filter(|value| **value > 0.15).count();
+        assert!(visible >= 50, "only {visible} broadband bands are visible");
+        assert!(spectrum.right.iter().all(|value| *value == 0.0));
+        assert!(spectrum.left.iter().all(|value| value.is_finite() && *value <= 1.0));
+    }
+
+    #[test]
+    fn visual_response_preserves_quiet_to_loud_dynamics_on_a_music_scale() {
+        let responses = [0.002, 0.02, 0.2].map(|amplitude| {
+            let pcm = stereo_sine(440.0, 48_000, 4096)
+                .into_iter()
+                .map(|value| value * amplitude)
+                .collect::<Vec<_>>();
+            spectrum_from_interleaved_pcm(&pcm, 48_000).left.iter().copied().fold(0.0_f32, f32::max)
+        });
+        // A 2% sine is about -34 dBFS: comfortably visible within the native
+        // -80..-8 dB display range, with room for quieter and louder signals.
+        assert!((0.55..0.85).contains(&responses[1]), "responses: {responses:?}");
+        assert!(responses[0] > 0.15 && responses[0] + 0.1 < responses[1]);
+        assert!(responses[1] + 0.1 < responses[2] && responses[2] <= 1.0);
+    }
+
+    #[test]
+    fn boosted_float_pcm_does_not_introduce_harmonic_bands() {
+        let reference = stereo_sine(440.0, 48_000, 4096)
+            .into_iter()
+            .map(|value| value * 0.25)
+            .collect::<Vec<_>>();
+        let baseline = spectrum_from_interleaved_pcm(&reference, 48_000);
+        for gain in [6.0, 13.5] {
+            // Valid float capture peaks of 1.5 and 3.375 must retain the sine's
+            // shape. Clipping at unity would add third/fifth/seventh harmonics.
+            let boosted = reference.iter().map(|value| value * gain).collect::<Vec<_>>();
+            let spectrum = spectrum_from_interleaved_pcm(&boosted, 48_000);
+            assert!(spectrum.left[7..=10].iter().any(|value| *value > 0.9));
+            // Hand-selected Mel ranges around 1320, 2200 and 3080 Hz.
+            for bands in [17..=21, 25..=29, 31..=35] {
+                for band in bands {
+                    assert!(
+                        spectrum.left[band] <= baseline.left[band] + 0.02,
+                        "gain {gain}: new harmonic response {} in band {band} (reference {})",
+                        spectrum.left[band],
+                        baseline.left[band]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spectrum_ignores_old_backlog_and_unpaired_trailing_sample() {
+        let recent = stereo_sine(110.0, 48_000, 4096);
+        let mut backlog = stereo_sine(6107.0, 48_000, 8192);
+        backlog.extend_from_slice(&recent);
+        backlog.push(1.0);
+        assert_eq!(
+            spectrum_from_interleaved_pcm(&backlog, 48_000),
+            spectrum_from_interleaved_pcm(&recent, 48_000)
+        );
+    }
+
+    #[test]
+    fn malformed_pcm_and_extreme_sample_rates_remain_finite_and_bounded() {
+        let invalid = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::NAN].repeat(2048);
+        let spectrum = spectrum_from_interleaved_pcm(&invalid, 48_000);
+        assert!(spectrum.flattened().iter().all(|value| *value == 0.0));
+        for sample_rate in [0, 1, 8000, 44_100, 48_000, 192_000, u32::MAX] {
+            for frames in [0, 1, 2, 127, 4096] {
+                let pcm = [f32::MAX, -f32::MAX].repeat(frames);
+                assert!(spectrum_from_interleaved_pcm(&pcm, sample_rate)
+                    .flattened()
+                    .iter()
+                    .all(|value| value.is_finite() && (0.0..=1.0).contains(value)));
+            }
+        }
     }
 
     #[test]

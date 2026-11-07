@@ -326,6 +326,8 @@ impl LayerShellState {
                 fractional_scale: self.output.render_scale_factor(),
                 scale_mode: self.output.scale_mode,
                 paused: self.pause_state.effective(),
+                manual_paused: self.pause_state.manual(),
+                rule_paused: self.pause_state.rule(),
                 viewport_width: self.output.geometry.viewport_width,
                 viewport_height: self.output.geometry.viewport_height,
                 viewport_source: self

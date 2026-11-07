@@ -36,6 +36,7 @@ pub struct BackendContext<'a> {
     pub cfg: &'a Config,
     pub desired_cfg: Arc<Mutex<Config>>,
     pub shutdown_requested: Arc<AtomicBool>,
+    pub manual_pause: Arc<AtomicBool>,
     pub host_integrations: HostIntegrations,
     pub control_rx: &'a mpsc::Receiver<ControlCommand>,
     pub output_playlist_rx: Option<&'a mpsc::Receiver<OutputPlaylistRequest>>,

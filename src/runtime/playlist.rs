@@ -353,7 +353,19 @@ pub(crate) fn apply_selection_to_config(
     config: &mut Config,
     selection: &PlaylistSelection,
 ) -> Result<()> {
-    config.renderer.source = selection.source.clone();
+    let project = Path::new(&selection.source).join("project.json");
+    let source = Path::new(&selection.source);
+    let missing_workshop_item = source.file_name().and_then(|name| name.to_str())
+        == Some(&selection.wallpaper_id)
+        && selection.wallpaper_id.bytes().all(|byte| byte.is_ascii_digit())
+        && source.parent().is_some_and(Path::is_dir);
+    let resolved = (project.is_file() || missing_workshop_item)
+        .then(|| we_core::wallpaper::resolve_wallpaper_source(&project))
+        .transpose()?;
+    config.renderer.source = resolved
+        .as_ref()
+        .map(|source| source.project_json.parent().unwrap().display().to_string())
+        .unwrap_or_else(|| selection.source.clone());
     let wallpaper_profile = config.wallpapers.get(&selection.wallpaper_id).cloned();
     let wallpaper = wallpaper_profile.clone().unwrap_or_else(WallpaperSettings::default);
     let fps_limit = config.renderer.max_fps.unwrap_or(config.renderer.fps).clamp(1, 360);
@@ -376,9 +388,11 @@ pub(crate) fn apply_selection_to_config(
             config.renderer.render_height = Some(height.max(1));
         }
     }
+    let mut properties = resolved.map(|source| source.user_properties).unwrap_or_default();
+    properties.extend(wallpaper.user_properties);
     config.renderer.options_json = Some(we_core::config::merge_scene_source_options(
         config.renderer.options_json.as_deref(),
-        Some(wallpaper.user_properties),
+        Some(properties),
         config.general.force_scene_audio_loop,
     )?);
     Ok(())
@@ -506,6 +520,61 @@ mod tests {
             .expect("apply playlist selection");
 
         assert_eq!(runtime_config.renderer.msaa_samples, 8);
+    }
+
+    #[test]
+    fn preset_selection_resolves_base_and_keeps_preset_profile_overrides() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("we-playlist-preset-{suffix}"));
+        fs::create_dir_all(root.join("100")).unwrap();
+        fs::create_dir_all(root.join("200")).unwrap();
+        fs::write(root.join("100/project.json"), r#"{"type":"scene","file":"scene.json"}"#)
+            .unwrap();
+        fs::write(
+            root.join("200/project.json"),
+            r#"{"dependency":"100","preset":{"speed":2,"color":"red"}}"#,
+        )
+        .unwrap();
+        let mut config = crate::config::Config::default();
+        config.wallpapers.insert(
+            "200".into(),
+            we_core::wallpaper::settings::WallpaperSettings {
+                user_properties: std::collections::BTreeMap::from([(
+                    "speed".into(),
+                    serde_json::json!(3),
+                )]),
+                ..Default::default()
+            },
+        );
+        super::apply_selection_to_config(
+            &mut config,
+            &super::PlaylistSelection {
+                index: 0,
+                wallpaper_id: "200".into(),
+                source: root.join("200").display().to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(std::path::Path::new(&config.renderer.source), root.join("100"));
+        let options: serde_json::Value =
+            serde_json::from_str(config.renderer.options_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            options["scene"]["userProperties"],
+            serde_json::json!({"speed":3,"color":"red"})
+        );
+        super::apply_selection_to_config(
+            &mut config,
+            &super::PlaylistSelection {
+                index: 0,
+                wallpaper_id: "100".into(),
+                source: root.join("100").display().to_string(),
+            },
+        )
+        .unwrap();
+        let options: serde_json::Value =
+            serde_json::from_str(config.renderer.options_json.as_deref().unwrap()).unwrap();
+        assert_eq!(options["scene"]["userProperties"], serde_json::json!({}));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -72,6 +72,7 @@ pub fn run(config_path: Option<&Path>) -> Result<()> {
     let runtime_state = Arc::new(Mutex::new(RuntimeState::new(&cfg)));
     let scene_runtime = Arc::new(Mutex::new(SceneRuntime::default()));
     let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let manual_pause = Arc::new(AtomicBool::new(false));
     let scheduler_stop = Arc::new(AtomicBool::new(false));
     let mut host_runtime =
         Some(HostIntegrationRuntime::start(desired_cfg.clone(), shutdown_requested.clone()));
@@ -115,10 +116,16 @@ pub fn run(config_path: Option<&Path>) -> Result<()> {
         },
         {
             let runtime_state = runtime_state.clone();
+            let manual_pause = manual_pause.clone();
             let playlist_runtime = playlist_runtime.clone();
             let scheduler_stop = scheduler_stop.clone();
             let playlist_state_path = playlist_state_path.clone();
             move |cmd| {
+                match cmd {
+                    ControlCommand::Pause => manual_pause.store(true, Ordering::Relaxed),
+                    ControlCommand::Resume => manual_pause.store(false, Ordering::Relaxed),
+                    _ => {}
+                }
                 let handled = handle_runtime_control_command(cmd, &command_tx, &runtime_state)?;
                 let now = Instant::now();
                 if let Ok(mut runtime) = playlist_runtime.lock() {
@@ -527,6 +534,7 @@ pub fn run(config_path: Option<&Path>) -> Result<()> {
                 control_rx: &control_rx,
                 output_playlist_rx: &output_playlist_rx,
                 host_integrations: host_integrations.clone(),
+                manual_pause: manual_pause.clone(),
             },
         ) {
             Ok(exit) => exit,
@@ -712,6 +720,7 @@ fn schedule_config_reconfigure_guarded(
     runtime_state: &Arc<Mutex<RuntimeState>>,
     control_tx: &mpsc::Sender<ControlCommand>,
 ) -> Result<bool> {
+    backend::layer_shell::orchestrator::validate_output_sources(&next_cfg)?;
     let serialized = next_cfg.to_toml_pretty()?;
     let expected_serialized = expected_config.map(Config::to_toml_pretty).transpose()?;
     {
@@ -924,6 +933,7 @@ struct RuntimeLoopInputs<'a> {
     control_rx: &'a mpsc::Receiver<ControlCommand>,
     output_playlist_rx: &'a mpsc::Receiver<ipc::OutputPlaylistRequest>,
     host_integrations: HostIntegrations,
+    manual_pause: Arc<AtomicBool>,
 }
 
 fn run_runtime_loop(cfg: &Config, inputs: RuntimeLoopInputs<'_>) -> Result<RuntimeLoopExit> {
@@ -935,6 +945,7 @@ fn run_runtime_loop(cfg: &Config, inputs: RuntimeLoopInputs<'_>) -> Result<Runti
         control_rx,
         output_playlist_rx,
         host_integrations,
+        manual_pause,
     } = inputs;
     let mut cfg = cfg.clone();
     cfg.renderer.options_json = Some(we_core::config::merge_scene_source_options(
@@ -954,11 +965,8 @@ fn run_runtime_loop(cfg: &Config, inputs: RuntimeLoopInputs<'_>) -> Result<Runti
     // wallpaper profile: fps, volume, mute, fill mode...) so configs written
     // for the LayerShell multi-output model still work.
     if backend == BackendKind::Gnome {
-        if let Some(binding) = cfg
-            .outputs
-            .values()
-            .find(|binding| binding.source.is_some())
-            .cloned()
+        if let Some(binding) =
+            cfg.outputs.values().find(|binding| binding.source.is_some()).cloned()
         {
             playlist::apply_selection_to_config(
                 &mut cfg,
@@ -988,12 +996,15 @@ fn run_runtime_loop(cfg: &Config, inputs: RuntimeLoopInputs<'_>) -> Result<Runti
 
     if let Ok(mut state) = runtime_state.lock() {
         state.mark_running(generation);
+        if manual_pause.load(Ordering::Relaxed) {
+            state.mark_paused();
+        }
     }
 
     let mut backend_impl = backend::create_backend(backend);
     let hook_cfg = desired_cfg.clone();
     let mut hook_triggers = BTreeMap::<String, (String, WallpaperAppliedTrigger)>::new();
-    let mut status_sink = |snapshot: RuntimeStatusSnapshot| {
+    let mut status_sink = |mut snapshot: RuntimeStatusSnapshot| {
         let output_key = snapshot.output_name.clone();
         let source = if snapshot.output_source.is_empty() {
             cfg.renderer.source.clone()
@@ -1012,6 +1023,7 @@ fn run_runtime_loop(cfg: &Config, inputs: RuntimeLoopInputs<'_>) -> Result<Runti
             }
             entry.1.observe(&snapshot)
         };
+        snapshot.output_source = source.clone();
         update_runtime_snapshot(runtime_state, snapshot);
         if wallpaper_applied {
             if let Ok(current_cfg) = hook_cfg.lock() {
@@ -1026,6 +1038,7 @@ fn run_runtime_loop(cfg: &Config, inputs: RuntimeLoopInputs<'_>) -> Result<Runti
         cfg: &cfg,
         desired_cfg,
         shutdown_requested: shutdown_requested.clone(),
+        manual_pause,
         host_integrations,
         control_rx,
         output_playlist_rx: Some(output_playlist_rx),
@@ -1438,6 +1451,7 @@ mod tests {
     #[test]
     fn status_toml_reports_renderer_source() {
         let mut cfg = Config::default();
+        cfg.general.backend = crate::config::ConfigBackend::LayerShell;
         cfg.renderer.source = "/tmp/workshop/item".to_string();
         let mut state = RuntimeState::new(&cfg);
         let generation = state.begin_session(&cfg);
@@ -1494,6 +1508,34 @@ mod tests {
         assert_eq!(desired.lock().unwrap().playlists.active, Some("Manual".to_string()));
         assert!(desired.lock().unwrap().outputs.is_empty());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn invalid_preset_switch_is_rejected_before_mutating_running_state() {
+        let path = temp_config_path("invalid-preset-switch");
+        let root = path.with_extension("workshop");
+        fs::create_dir_all(root.join("200")).unwrap();
+        fs::write(root.join("200/project.json"), r#"{"dependency":"100","preset":{}}"#).unwrap();
+        let original = Config::default();
+        let desired = Arc::new(Mutex::new(original.clone()));
+        let status = Arc::new(Mutex::new("existing status".to_string()));
+        let runtime = Arc::new(Mutex::new(RuntimeState::new(&original)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut proposed = original.clone();
+        proposed.outputs.insert(
+            "DP-1".into(),
+            we_core::config::OutputBinding::wallpaper(
+                "200",
+                root.join("200").display().to_string(),
+            ),
+        );
+        let result =
+            schedule_config_reconfigure_guarded(proposed, None, &desired, &status, &runtime, &tx);
+        assert!(result.is_err(), "invalid preset was accepted");
+        assert!(desired.lock().unwrap().outputs.is_empty());
+        assert_eq!(*status.lock().unwrap(), "existing status");
+        assert!(rx.try_recv().is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1603,6 +1645,7 @@ mod tests {
                 control_rx: &rx,
                 output_playlist_rx: &output_rx,
                 host_integrations: crate::runtime::integrations::HostIntegrations::default(),
+                manual_pause: std::sync::Arc::new(AtomicBool::new(false)),
             },
         )
         .expect_err("missing source should fail");
@@ -1641,6 +1684,7 @@ mod tests {
                 control_rx: &rx,
                 output_playlist_rx: &output_rx,
                 host_integrations: crate::runtime::integrations::HostIntegrations::default(),
+                manual_pause: std::sync::Arc::new(AtomicBool::new(false)),
             },
         )
         .expect_err("invalid options_json should fail");

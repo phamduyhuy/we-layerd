@@ -85,7 +85,8 @@ fn renderer_fill_mode(value: we_core::wallpaper::settings::WallpaperFillMode) ->
 
 fn can_present_next_frame(state: &LayerShellState) -> bool {
     state.running
-        && !state.pause_state.effective()
+        // Even paused sessions need one buffer to map the new wallpaper surface.
+        && (!state.pause_state.effective() || state.frame_stats.presented == 0)
         && !state.stopping
         && (!state.frame_callback.gated
             || (state.frame_callback.ready_for_next_frame && !state.frame_callback.pending))
@@ -110,7 +111,9 @@ fn apply_pause_state(state: &mut LayerShellState, previous: bool) {
     }
     if let Some(session) = state.session.as_mut() {
         if current {
-            session.pause();
+            if state.frame_stats.presented > 0 {
+                session.pause();
+            }
         } else {
             session.resume();
             state.frame_callback.ready_for_next_frame = true;
@@ -334,6 +337,7 @@ pub(crate) fn run_output_with_role(
 
     let cfg = ctx.cfg;
     let control_rx = ctx.control_rx;
+    let manual_pause = ctx.manual_pause.clone();
     let status_sink = ctx.status_sink;
     let host_integrations = ctx.host_integrations.clone();
 
@@ -438,7 +442,9 @@ pub(crate) fn run_output_with_role(
         },
         render_resolution_follows_output: cfg.renderer.render_width.is_none()
             && cfg.renderer.render_height.is_none(),
-        pause_state: crate::runtime::rules::PauseState::default(),
+        pause_state: crate::runtime::rules::PauseState::new(
+            manual_pause.load(std::sync::atomic::Ordering::Relaxed),
+        ),
         configured_muted: cfg.renderer.muted,
         rule_muted: false,
         applied_muted: cfg.renderer.muted,
@@ -558,6 +564,7 @@ pub(crate) fn run_output_with_role(
         fill_mode: renderer_fill_mode(cfg.renderer.fill_mode),
         rotation_degrees: cfg.renderer.rotation_degrees,
     })?;
+    // Bootstrap a visible first frame even when manual/window policy is paused.
     session.play()?;
     let renderer_frame_fd = session.frame_ready_fd()?;
     state.session = Some(session);
@@ -778,6 +785,10 @@ pub(crate) fn run_output_with_role(
                         note_frame_acquired(&mut state, &frame);
                         presenter::present_frame(&mut state, &qh, frame)
                             .context("failed to present frame")?;
+                        if state.frame_stats.presented == 1 {
+                            // A pause deferred during startup becomes effective only after map.
+                            apply_pause_state(&mut state, false);
+                        }
                         last_acquire_status = 0;
                         status_sink(state.snapshot());
                     }
@@ -837,6 +848,7 @@ mod tests {
         state.frame_callback.ready_for_next_frame = true;
         assert_eq!(renderer_poll_events(&state), libc::POLLIN);
 
+        state.frame_stats.presented = 1;
         state.pause_state.set_rule(true);
         assert_eq!(renderer_poll_events(&state), 0);
 
@@ -855,5 +867,21 @@ mod tests {
         state.buffers.max_in_flight = 3;
         state.running = false;
         assert_eq!(renderer_poll_events(&state), 0);
+    }
+    #[test]
+    fn paused_new_wallpaper_publishes_first_frame_before_freezing() {
+        for manual in [false, true] {
+            let mut state = LayerShellState::test_default(ScaleMode::Cover);
+            state.frame_callback.ready_for_next_frame = true;
+            state.pause_state.set_manual(manual);
+            state.pause_state.set_rule(!manual);
+            assert_eq!(
+                renderer_poll_events(&state),
+                libc::POLLIN,
+                "paused startup must map a first buffer instead of leaving the desktop empty"
+            );
+            state.frame_stats.presented = 1;
+            assert_eq!(renderer_poll_events(&state), 0);
+        }
     }
 }
